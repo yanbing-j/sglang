@@ -1215,6 +1215,7 @@ at::Tensor shared_expert_cpu(
           N,
           K);
     } else if (use_fp8_w8a16) {
+      out_hidden_states = at::empty({M, 2 * N}, hidden_states.options());
       float* __restrict__ C_tmp = (float*)((void*)(intermediate_cache1 + M * N));
       auto w1s = w1_scale.value();
       auto w2s = w2_scale.value();
