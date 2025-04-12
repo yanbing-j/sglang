@@ -431,6 +431,22 @@ void shared_expert_fp8_kernel_impl(
     //     C1,
     //     m_size,
     //     N);
+    
+    }
+    using bVec = at::vec::Vectorized<scalar_t>;
+    using fVec = at::vec::Vectorized<float>;
+  
+    const bVec one = bVec(1.f);
+    for (int64_t m = 0; m < M; m++) {
+      for (int64_t d = 0; d < N;d+=bVec::size()) {
+        bVec x_ = bVec::loadu(output + m * 2 * N + d);
+        bVec y_ = bVec::loadu(output + m * 2 * N + N + d);
+        x_ = x_ / (one + x_.neg().exp_u20());
+        // mul
+        x_ = x_ * y_;
+        // convert
+        x_.store(output + m * 2 * N + d);
+      }
     }
 // }
 // // });
