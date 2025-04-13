@@ -12,7 +12,6 @@ inline void add_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict_
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
   constexpr int kVecSize = bVec::size();
-  std::cout<<"bvecsize "<<kVecSize<<" fvecsize "<<fVec::size()<<"\n";
   const fVec s_vec = fVec(scale);
   int64_t d;
   #pragma GCC unroll 4
@@ -72,15 +71,15 @@ void shared_expert_fp8_kernel_impl(
 
   int64_t mat1_strideM = K;
   int64_t out_strideM = 2 * N;
+  alignas(64) scalar_t my_output[M * 2 * N];
+  alignas(64) scalar_t output_ic1[M * N];
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  // at::parallel_for(0, MB * NB, 102400, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
     alignas(64) scalar_t Btmp[BLOCK_N * BLOCK_K];
-    alignas(64) scalar_t my_output[M * 2 * N];
-    alignas(64) scalar_t output_ic1[M * N];
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
 
-    for (int64_t i = 0; i < MB * NB; ++i) {
+    for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB;
       int64_t nb = i % NB;
 
@@ -106,8 +105,8 @@ void shared_expert_fp8_kernel_impl(
         /*   ldc                */ out_strideM,
         /*   brg                */ use_brgemm,
         /*   block_size_K       */ block_size_K);
-    
     }
+  });
     using bVec = at::vec::Vectorized<scalar_t>;
     using fVec = at::vec::Vectorized<float>;
     const fVec one = fVec(1.f);
@@ -142,13 +141,13 @@ void shared_expert_fp8_kernel_impl(
   blocks_n_per_group = block_size_N / BLOCK_N;
 
   // parallel on [MB2, NB2]
-  // at::parallel_for(0, MB2 * NB2, 102400, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
     alignas(64) scalar_t Btmp2[BLOCK_K * BLOCK_N];
     alignas(64) scalar_t my_output2[M * K];
     alignas(64) scalar_t C2[BLOCK_M * BLOCK_K];
     alignas(64) float Ctmp2[BLOCK_M * BLOCK_K];
 
-    for (int64_t i = 0; i < MB2 * NB2; ++i) {
+    for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB2;
       int64_t nb = i % NB2;
       const float* scale_ptr_2 = w2s + (nb / blocks_n_per_group) * scale_size_K;
@@ -180,8 +179,8 @@ void shared_expert_fp8_kernel_impl(
       for (int64_t m = 0; m < mb_size; ++m) {
         add_mul_stub(out + m * K, C2 + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, nb_size);
       }
-
       }
+    });
 
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
