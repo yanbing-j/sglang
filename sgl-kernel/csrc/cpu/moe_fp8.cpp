@@ -366,14 +366,22 @@ void shared_expert_fp8_kernel_impl(
     
     }
     using bVec = at::vec::Vectorized<scalar_t>;
-    const bVec one = bVec(1.f);
+    using fVec = at::vec::Vectorized<float>;
+    const fVec one = fVec(1.f);
     for (int64_t m = 0; m < M; m++) {
-      for (int64_t d = 0; d < N;d+=bVec::size()) {
-        bVec x_ = bVec::loadu(my_output + m * 2 * N + d);
-        bVec y_ = bVec::loadu(my_output + m * 2 * N + N + d);
-        x_ = x_ / (one + x_.neg().exp_u20());
-        x_ = x_ * y_;
-        x_.store(output_ic1 + m * N + d);
+      for (int64_t d = 0; d < N; d += bVec::size()) {
+        bVec x = bVec::loadu(my_output + m * 2 * N + d);
+        fVec x0, x1;
+        std::tie(x0, x1) = at::vec::convert_to_float(x);
+        bVec y = bVec::loadu(my_output + m * 2 * N + N + d);
+        fVec y0, y1;
+        std::tie(y0, y1) = at::vec::convert_to_float(y);
+        x0 = x0 / (one + x0.neg().exp_u20());
+        x1 = x1 / (one + x1.neg().exp_u20());
+        x0 = x0 * y0;
+        x1 = x1 * y1;
+        bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+        out_vec.store(output_ic1 + m * N + d);
       }
     }
 
