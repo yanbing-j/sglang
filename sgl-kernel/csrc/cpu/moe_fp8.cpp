@@ -313,75 +313,40 @@ void shared_expert_fp8_kernel_impl(
   // handle 2 tiles per block
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
-  // print the above values
-  std::cout<<"BLOCK_M "<<BLOCK_M<<" BLOCK_N "<<BLOCK_N<<"\n";
 
    // stage 1: intermediate_cache1 = silu(hidden_states @ w1)
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(2 * N, BLOCK_N);
-  // print the above values
-  std::cout<<"MB "<<MB<<" NB "<<NB<<"\n";
-
-   int64_t scale_size_N = div_up(2 * N, block_size_N);
-   int64_t scale_size_K = div_up(K, block_size_K);
-   int64_t blocks_n_per_group = block_size_N / BLOCK_N;
-  // print the above values
-  std::cout<<"scale_size_N "<<scale_size_N<<" scale_size_K "<<scale_size_K<<"\n";
-  // print the above values
-  std::cout<<"blocks_n_per_group "<<blocks_n_per_group<<"\n";
+  int64_t scale_size_N = div_up(2 * N, block_size_N);
+  int64_t scale_size_K = div_up(K, block_size_K);
+  int64_t blocks_n_per_group = block_size_N / BLOCK_N;
 
   // TODO: add the support for use_brgemm = false;
   // use avx512-bf16 when a) M is small; b) dtype is bfloat16, otherwise use amx
   const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
 
-  TORCH_CHECK(N % BLOCK_N == 0, "Fixme when N is not multiples of ", BLOCK_N);
-
-  const int64_t stride_n = K;
   int64_t mat1_strideM = K;
   int64_t out_strideM = 2 * N;
 
-
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   // at::parallel_for(0, MB * NB, 102400, [&](int64_t begin, int64_t end) {
-    // get local pointers
-    // int tid = at::get_thread_num();
-    // float* __restrict__ C0_tmp = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
-    // float* __restrict__ C1_tmp = C0_tmp + BLOCK_M * BLOCK_N;
     alignas(64) scalar_t Btmp[BLOCK_N * BLOCK_K];
     alignas(64) scalar_t my_output[M * 2 * N];
     alignas(64) scalar_t output_ic1[M * N];
     alignas(64) scalar_t output_ic2[M * K];
-    // alignas(64) scalar_t C0[BLOCK_M * BLOCK_N];
-    // alignas(64) scalar_t C1[BLOCK_M * BLOCK_N];
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
-    alignas(64) scalar_t C0[BLOCK_M * BLOCK_N];
-    alignas(64) scalar_t C1[BLOCK_M * BLOCK_N];
 
     for (int64_t i = 0; i < MB * NB; ++i) {
-      printf("i = %ld\n", i);
       int64_t mb = i / NB;
       int64_t nb = i % NB;
-      // print mb nb
-      printf("mb = %ld, nb = %ld\n", mb, nb);
 
-      // nb0 from top half and nb1 from bottom half
-      // int64_t nb0 = nb, nb1 = nb + NB;
-      // const float* scale_ptr_nb0 = w1s + (nb0 / blocks_n_per_group) * scale_size_K;
-      // const float* scale_ptr_nb1 = w1s + (nb1 / blocks_n_per_group) * scale_size_K;
       const float* scale_ptr = w1s + (nb / blocks_n_per_group) * scale_size_K;
       int64_t mb_start = mb * BLOCK_M;
       int64_t mb_size = std::min(M - mb_start, BLOCK_M);
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(2 * N - nb_start, BLOCK_N);
-      // print the above values
-      printf("m_size = %ld, nb_size = %ld\n", mb_size, nb_size);
-      // // print scale_ptr_nb0 and scale_ptr_nb1
-      // printf("scale_ptr_nb0 = %f, scale_ptr_nb1 = %f\n", *scale_ptr_nb0, *scale_ptr_nb1);
 
-      // A shape [m_size, K]
-      const scalar_t* A = input + mb * BLOCK_M * K;
-
-      // 1.b gemm: C0 = A @ B0
+      // 1.b gemm: C = A @ B
       tinygemm_kernel<scalar_t, false>(
         /*   A                  */ input + mb_start * mat1_strideM,
         /*   B                  */ packed_w1 + nb_start * K,
@@ -398,64 +363,19 @@ void shared_expert_fp8_kernel_impl(
         /*   ldc                */ out_strideM,
         /*   brg                */ use_brgemm,
         /*   block_size_K       */ block_size_K);
-        // for (int64_t m = 0;m < mb_size;m++) {
-        //   for(int64_t d = 0;d < BLOCK_N;d++){
-        //     output[mb_start*out_strideM + nb_start + m*BLOCK_N+d] = C0[m*BLOCK_N + d];
-        //   }
-        // }
-      // 1.c gemm: C1 = A @ B1
-      // tinygemm_kernel<scalar_t, false>(
-      // /*   A                  */ A,
-      // /*   B                  */ packed_w1 + nb1 * BLOCK_N * stride_n,
-      // /*   C                  */ output + mb * BLOCK_M * N + nb1 * BLOCK_N,
-      // /*   Btmp               */ Btmp,
-      // /*   Ctmp               */ Ctmp,
-      // /*   scale              */ scale_ptr_nb1,
-      // /*   bias               */ nullptr,
-      // /*   M                  */ m_size,
-      // /*   N                  */ n_size,
-      // /*   K                  */ K,
-      // /*   lda                */ K,
-      // /*   ldb                */ n_size,
-      // /*   ldc                */ BLOCK_N,
-      // /*   brg                */ use_brgemm,
-      // /*   block_size_K       */ block_size_K);
-
-      // 1.d silu and mul
-    // silu_and_mul<scalar_t, BLOCK_N>(
-    //     ic1 + mb * BLOCK_M * N + nb * BLOCK_N,
-    //     C0,
-    //     C1,
-    //     m_size,
-    //     N);
     
     }
-    alignas(64) scalar_t out[M * N];
     using bVec = at::vec::Vectorized<scalar_t>;
-    using fVec = at::vec::Vectorized<float>;
-  
     const bVec one = bVec(1.f);
     for (int64_t m = 0; m < M; m++) {
       for (int64_t d = 0; d < N;d+=bVec::size()) {
         bVec x_ = bVec::loadu(my_output + m * 2 * N + d);
         bVec y_ = bVec::loadu(my_output + m * 2 * N + N + d);
         x_ = x_ / (one + x_.neg().exp_u20());
-        // mul
         x_ = x_ * y_;
-        // convert
         x_.store(output_ic1 + m * N + d);
       }
     }
-    
-    // for (int64_t m = 0; m < M; m++) {
-    //   for (int64_t n = 0;n < N * 2; n++) {
-    //     if (n < N) {
-    //       out[m * N + n] = output[m * 2 * N + n];
-    //     }
-    //   }
-    // }
-// }
-// // });
 
   // stage 2: intermediate_cache2 = intermediate_cache1 @ w2
   //   w2 : [K, N] as [OC, IC]
@@ -472,14 +392,10 @@ void shared_expert_fp8_kernel_impl(
 
   // parallel on [MB2, NB2]
   // at::parallel_for(0, MB2 * NB2, 102400, [&](int64_t begin, int64_t end) {
-    // get local pointers
-    // int tid = at::get_thread_num();
-    // we won't be using C1 for gemm2
     alignas(64) scalar_t Btmp2[BLOCK_K * BLOCK_N];
     alignas(64) scalar_t my_output2[M * K];
     alignas(64) scalar_t C2[BLOCK_M * BLOCK_K];
     alignas(64) float Ctmp2[BLOCK_M * BLOCK_K];
-    // float* __restrict__ Cx_tmp = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
 
     for (int64_t i = 0; i < MB2 * NB2; ++i) {
       int64_t mb = i / NB2;
@@ -490,14 +406,11 @@ void shared_expert_fp8_kernel_impl(
       int64_t nb_start = nb * BLOCK_N;
       int64_t nb_size = std::min(OC - nb_start, BLOCK_N);
 
-      // A shape [m_size, IC]
-      // const scalar_t* __restrict__ A = ic1 + mb * BLOCK_M * N;
-
       // 2.a gemm: C = A @ B
       tinygemm_kernel<scalar_t, false>(
         /*   A                  */ output_ic1 + mb_start * mat1_strideM,
         /*   B                  */ packed_w2 + nb_start * N,
-        /*   C                  */ C2,//output_ic2 + mb_start * out_strideM + nb_start,
+        /*   C                  */ C2,
         /*   Btmp               */ Btmp2,
         /*   Ctmp               */ Ctmp2,
         /*   scale              */ scale_ptr_2,
@@ -519,15 +432,10 @@ void shared_expert_fp8_kernel_impl(
       }
 
       }
-    //   for (int64_t m = 0; m < M; ++m) {
-    //     add_mul_stub(output + m * mat1_strideM, output_ic2 + m * mat1_strideM, fused_experts_out + m * mat1_strideM, routed_scaling_factor, mat1_strideM);
-    // }
 
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
     }
-  // });
-
 }
 
 #define INSTANTIATE_SHARED_EXPERT_FP8_TEMPLATE(TYPE)                                        \
