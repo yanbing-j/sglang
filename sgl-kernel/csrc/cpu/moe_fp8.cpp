@@ -4,49 +4,6 @@
 
 namespace {
 
-//   silu :    shape          leading dimension
-//  input0  [m_size, BLOCK_N]    BLOCK_N
-//  input1  [m_size, BLOCK_N]    BLOCK_N
-//  output  [M * topk, N]          N
-template <typename scalar_t, int BLOCK_N>
-inline void silu_and_mul(
-    scalar_t* __restrict__ output,
-    const scalar_t* __restrict__ input0,  // x: x0, x1
-    const scalar_t* __restrict__ input1,  // y: y0, y1
-    int64_t m_size,
-    int64_t N) {
-
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-
-  const bVec one = bVec(1.f);
-
-  // no remainder
-  for (int64_t m = 0; m < m_size; ++m) {
-    scalar_t* __restrict__ out = output + m * N;
-    const scalar_t* __restrict__ x = input0 + m * BLOCK_N;
-    const scalar_t* __restrict__ y = input1 + m * BLOCK_N;
-
-    for (int64_t d = 0; d < BLOCK_N; d += bVec::size()) {
-      // fVec x0 = fVec::loadu(x + d);
-      // fVec x1 = fVec::loadu(x + d + fVec::size());
-      // fVec y0 = fVec::loadu(y + d);
-      // fVec y1 = fVec::loadu(y + d + fVec::size());
-      bVec x_ = bVec::loadu(x + d);
-      bVec y_ = bVec::loadu(y + d);
-      // silu
-      x_ = x_ / (one + x_.neg().exp_u20());
-      // x1 = x1 / (one + x1.neg().exp_u20());
-      // mul
-      x_ = x_ * y_;
-      // x1 = x1 * y1;
-      // convert
-      // bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-      x_.store(out + d);
-    }
-  }
-}
-
 // out = input + input2 * scale
 template <typename scalar_t>
 inline void add_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
@@ -76,218 +33,6 @@ inline void add_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict_
   for (; d < size; ++d) {
     out[d] = static_cast<scalar_t>(input[d] + float(input2[d]) * scale);
   }
-}
-
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-
-  int64_t d;
-  #pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d);
-    fVec data1 = fVec::loadu(input + d + fVec::size());
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d]);
-  }
-}
-
-template <typename scalar_t>
-inline void copy_add_stub(scalar_t* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-
-  int64_t d;
-  #pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d) + fVec::loadu(bias + d);
-    fVec data1 = fVec::loadu(input + d + fVec::size()) + fVec::loadu(bias + d + fVec::size());
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] + bias[d]);
-  }
-}
-
-inline void unpack_B(
-    at::BFloat16* __restrict__ Btmp,
-    const at::Float8_e4m3fn* __restrict__ packed_B,
-    int N,
-    int K,
-    int ldb,
-    int ldb_tmp,
-    float scale) {
-  // [K/2, N, 2]
-  const int K2 = K >> 1;
-  const int ldb2 = ldb; // ldb * 2 >> 1;
-  const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(packed_B);
-  const __m512 vd = _mm512_set1_ps(scale);
-
-  constexpr int BLOCK_N = block_size_n();
-  // static_assert(BLOCK_N == 32);
-
-  for (int k = 0; k < K2; ++k) {
-    for (int n = 0; n < N; n += 64) { // BLOCK_N = 32
-        __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2 + n);
-
-        __m256i b8_0 = _mm512_extracti32x8_epi32(b8, 0);
-        __m256i b8_1 = _mm512_extracti32x8_epi32(b8, 1);
-
-        __m512bh bf16_0 = CVT_FP8_TO_BF16(b8_0);
-        __m512bh bf16_1 = CVT_FP8_TO_BF16(b8_1);
-
-        // Apply scale
-        __m512 f0_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
-        __m512 f0_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 1));
-        __m512 f1_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_1, 0));
-        __m512 f1_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_1, 1));
-
-        f0_lo = _mm512_mul_ps(f0_lo, vd);
-        f0_hi = _mm512_mul_ps(f0_hi, vd);
-        f1_lo = _mm512_mul_ps(f1_lo, vd);
-        f1_hi = _mm512_mul_ps(f1_hi, vd);
-
-        bf16_0 = _mm512_cvtne2ps_pbh(f0_hi, f0_lo);
-        bf16_1 = _mm512_cvtne2ps_pbh(f1_hi, f1_lo);
-
-        _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + n * 2 + 0, (__m512i)bf16_0);
-        _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + n * 2 + 32, (__m512i)bf16_1);
-    }
-  }
-}
-
-template <typename scalar_t, typename packed_t, bool has_bias>
-struct brgemm {
-  static inline void apply(
-      const scalar_t* __restrict__ A,
-      const packed_t* __restrict__ B,
-      scalar_t* __restrict__ C,
-      scalar_t* __restrict__ Btmp,
-      float* __restrict__ Ctmp,
-      const float* __restrict__ bias,
-      const float* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc) {
-    TORCH_CHECK(false, "struct brgemm: primary template not implemented!");
-  }
-};
-
-template <typename scalar_t, bool has_bias>
-struct brgemm<scalar_t, scalar_t, has_bias> {
-  static inline void apply(
-      const scalar_t* __restrict__ A,
-      const scalar_t* __restrict__ B,
-      scalar_t* __restrict__ C,
-      scalar_t* __restrict__ Btmp,
-      float* __restrict__ Ctmp,
-      const float* __restrict__ bias,
-      const float* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc) {
-    UNUSED(scale);
-
-    constexpr int BLOCK_N = block_size_n();
-    at::native::cpublas::brgemm(
-        M, N, K, lda, ldb, BLOCK_N, /* add_C */ false, A, B, Ctmp);
-
-    // copy from Ctmp to C
-    for (int m = 0; m < M; ++m) {
-      if constexpr (has_bias) {
-        copy_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, bias, N);
-      } else {
-        copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
-      }
-    }
-  }
-};
-
-template <bool has_bias>
-struct brgemm<at::BFloat16, at::Float8_e4m3fn, has_bias> {
-  static inline void apply(
-      const at::BFloat16* __restrict__ A,
-      const at::Float8_e4m3fn* __restrict__ B,
-      at::BFloat16* __restrict__ C,
-      at::BFloat16* __restrict__ Btmp,
-      float* __restrict__ Ctmp,
-      const float* __restrict__ bias,
-      const float* __restrict__ scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc) {
-    constexpr int BLOCK_N = block_size_n();
-
-    // [BLOCK_K, BLOCK_N] -> [BLOCK_K / 2, BLOCK_N * 2]
-    const int ldb_tmp = block_size_n();
-
-    static_assert(BLOCK_K == 128);
-
-    // accumulate across K per BLOCK_K
-    for (int k = 0; k < K; k += BLOCK_K) {
-      int kb_size = std::min(BLOCK_K, K - k);
-
-      int idx = k >> 7; // k / BLOCK_K where BLOCK_K = 128
-      unpack_B(Btmp, B + k * ldb, N, kb_size, ldb, ldb_tmp, scale[idx]);
-
-      const bool add_C = (k != 0);
-      at::native::cpublas::brgemm(
-          M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
-    }
-
-    // copy from Ctmp to C
-    for (int m = 0; m < M; ++m) {
-      if constexpr (has_bias) {
-        copy_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, bias, N);
-      } else {
-        copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
-      }
-    }
-  }
-};
-
-template <typename scalar_t, bool has_bias>
-void tinygemm_kernel(
-    const scalar_t* __restrict__ A,
-    const at::Float8_e4m3fn* __restrict__ B,
-    scalar_t* __restrict__ C,
-    scalar_t* __restrict__ Btmp,
-    float* __restrict__ Ctmp,
-    const float* __restrict__ scale,
-    const float* __restrict__ bias,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg,
-    int64_t block_size_K) {
-
-  if (brg) {
-    brgemm<scalar_t, at::Float8_e4m3fn, has_bias>::apply(
-        A, B, C, Btmp, Ctmp, bias, scale, M, N, K, lda, ldb, ldc);
-    return;
-  }
-
-  // TODO: add the support for use_brgemm = false;
-  TORCH_CHECK(false, "use_brgemm = false is not supported yet");
 }
 
 }
@@ -333,7 +78,6 @@ void shared_expert_fp8_kernel_impl(
     alignas(64) scalar_t Btmp[BLOCK_N * BLOCK_K];
     alignas(64) scalar_t my_output[M * 2 * N];
     alignas(64) scalar_t output_ic1[M * N];
-    alignas(64) scalar_t output_ic2[M * K];
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
 
     for (int64_t i = 0; i < MB * NB; ++i) {
@@ -347,14 +91,13 @@ void shared_expert_fp8_kernel_impl(
       int64_t nb_size = std::min(2 * N - nb_start, BLOCK_N);
 
       // 1.b gemm: C = A @ B
-      tinygemm_kernel<scalar_t, false>(
+      tinygemm_kernel<scalar_t>(
         /*   A                  */ input + mb_start * mat1_strideM,
         /*   B                  */ packed_w1 + nb_start * K,
         /*   C                  */ my_output + mb_start * out_strideM + nb_start,
         /*   Btmp               */ Btmp,
         /*   Ctmp               */ Ctmp,
         /*   scale              */ scale_ptr,
-        /*   bias               */ nullptr,
         /*   M                  */ mb_size,
         /*   N                  */ nb_size,
         /*   K                  */ K,
@@ -415,14 +158,13 @@ void shared_expert_fp8_kernel_impl(
       int64_t nb_size = std::min(OC - nb_start, BLOCK_N);
 
       // 2.a gemm: C = A @ B
-      tinygemm_kernel<scalar_t, false>(
+      tinygemm_kernel<scalar_t>(
         /*   A                  */ output_ic1 + mb_start * mat1_strideM,
         /*   B                  */ packed_w2 + nb_start * N,
         /*   C                  */ C2,
         /*   Btmp               */ Btmp2,
         /*   Ctmp               */ Ctmp2,
         /*   scale              */ scale_ptr_2,
-        /*   bias               */ nullptr,
         /*   M                  */ mb_size,
         /*   N                  */ nb_size,
         /*   K                  */ IC,
