@@ -464,8 +464,8 @@ void shared_expert_fp8_kernel_impl(
   const int64_t MB2 = MB;
   const int64_t NB2 = div_up(OC, BLOCK_N);
   const int64_t stride_oc = N;
-  mat1_strideM = N;
-  out_strideM = K;
+  mat1_strideM = IC;
+  out_strideM = OC;
   scale_size_N = div_up(K, block_size_N);
   scale_size_K = div_up(N, block_size_K);
   blocks_n_per_group = block_size_N / BLOCK_N;
@@ -497,7 +497,7 @@ void shared_expert_fp8_kernel_impl(
       tinygemm_kernel<scalar_t, false>(
         /*   A                  */ output_ic1 + mb_start * mat1_strideM,
         /*   B                  */ packed_w2 + nb_start * N,
-        /*   C                  */ output_ic2 + mb_start * out_strideM + nb_start,
+        /*   C                  */ C2,//output_ic2 + mb_start * out_strideM + nb_start,
         /*   Btmp               */ Btmp2,
         /*   Ctmp               */ Ctmp2,
         /*   scale              */ scale_ptr_2,
@@ -507,18 +507,21 @@ void shared_expert_fp8_kernel_impl(
         /*   K                  */ IC,
         /*   lda                */ mat1_strideM,
         /*   ldb                */ nb_size,
-        /*   ldc                */ out_strideM,
+        /*   ldc                */ BLOCK_N,
         /*   brg                */ use_brgemm,
         /*   block_size_K       */ block_size_K);
 
   //       // 2.b copy from C to output and add fused_experts_out
+      scalar_t* __restrict__ out = output + mb_start * out_strideM + nb_start;
+      const scalar_t* __restrict__ fused_out = fused_experts_out + mb_start * out_strideM + nb_start;
+      for (int64_t m = 0; m < mb_size; ++m) {
+        add_mul_stub(out + m * K, C2 + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, nb_size);
+      }
 
       }
-      // scalar_t* __restrict__ out = output + mb_start * mat1_strideM + nb_start;
-      // const scalar_t* __restrict__ fused_out = fused_experts_out + mb_start * mat1_strideM + nb_start;
-      for (int64_t m = 0; m < M; ++m) {
-        add_mul_stub(output + m * mat1_strideM, output_ic2 + m * mat1_strideM, fused_experts_out + m * mat1_strideM, routed_scaling_factor, mat1_strideM);
-    }
+    //   for (int64_t m = 0; m < M; ++m) {
+    //     add_mul_stub(output + m * mat1_strideM, output_ic2 + m * mat1_strideM, fused_experts_out + m * mat1_strideM, routed_scaling_factor, mat1_strideM);
+    // }
 
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
