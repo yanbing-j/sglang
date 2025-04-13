@@ -350,6 +350,7 @@ void shared_expert_fp8_kernel_impl(
     alignas(64) scalar_t Btmp[BLOCK_N * BLOCK_K];
     alignas(64) scalar_t my_output[M * 2 * N];
     alignas(64) scalar_t output_ic1[M * N];
+    alignas(64) scalar_t output_ic2[M * K];
     // alignas(64) scalar_t C0[BLOCK_M * BLOCK_N];
     // alignas(64) scalar_t C1[BLOCK_M * BLOCK_N];
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
@@ -496,7 +497,7 @@ void shared_expert_fp8_kernel_impl(
       tinygemm_kernel<scalar_t, false>(
         /*   A                  */ output_ic1 + mb_start * mat1_strideM,
         /*   B                  */ packed_w2 + nb_start * N,
-        /*   C                  */ output + mb_start * out_strideM + nb_start,
+        /*   C                  */ output_ic2 + mb_start * out_strideM + nb_start,
         /*   Btmp               */ Btmp2,
         /*   Ctmp               */ Ctmp2,
         /*   scale              */ scale_ptr_2,
@@ -511,12 +512,13 @@ void shared_expert_fp8_kernel_impl(
         /*   block_size_K       */ block_size_K);
 
   //       // 2.b copy from C to output and add fused_experts_out
-  //       scalar_t* __restrict__ out = output + mb * BLOCK_M * K + nb * BLOCK_N;
-  //       const scalar_t* __restrict__ fused_out = fused_experts_out + mb * BLOCK_M * K + nb * BLOCK_N;
-  //       for (int64_t m = 0; m < m_size; ++m) {
-  //         add_mul_stub(out + m * K, C2 + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, n_size);
-  //     }
+
       }
+      // scalar_t* __restrict__ out = output + mb_start * mat1_strideM + nb_start;
+      // const scalar_t* __restrict__ fused_out = fused_experts_out + mb_start * mat1_strideM + nb_start;
+      for (int64_t m = 0; m < M; ++m) {
+        add_mul_stub(output + m * mat1_strideM, output_ic2 + m * mat1_strideM, fused_experts_out + m * mat1_strideM, routed_scaling_factor, mat1_strideM);
+    }
 
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
