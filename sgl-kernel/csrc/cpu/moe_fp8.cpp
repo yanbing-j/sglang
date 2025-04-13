@@ -348,6 +348,7 @@ void shared_expert_fp8_kernel_impl(
     // float* __restrict__ C0_tmp = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     // float* __restrict__ C1_tmp = C0_tmp + BLOCK_M * BLOCK_N;
     alignas(64) scalar_t Btmp[BLOCK_N * BLOCK_K];
+    alignas(64) scalar_t my_output[M * 2 * N];
     // alignas(64) scalar_t C0[BLOCK_M * BLOCK_N];
     // alignas(64) scalar_t C1[BLOCK_M * BLOCK_N];
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
@@ -382,7 +383,7 @@ void shared_expert_fp8_kernel_impl(
       tinygemm_kernel<scalar_t, false>(
         /*   A                  */ input + mb_start * mat1_strideM,
         /*   B                  */ packed_w1 + nb_start * K,
-        /*   C                  */ output + mb_start * out_strideM + nb_start,
+        /*   C                  */ my_output + mb_start * out_strideM + nb_start,
         /*   Btmp               */ Btmp,
         /*   Ctmp               */ Ctmp,
         /*   scale              */ scale_ptr,
@@ -433,21 +434,30 @@ void shared_expert_fp8_kernel_impl(
     //     N);
     
     }
+    alignas(64) scalar_t out[M * N];
     using bVec = at::vec::Vectorized<scalar_t>;
     using fVec = at::vec::Vectorized<float>;
   
     const bVec one = bVec(1.f);
     for (int64_t m = 0; m < M; m++) {
       for (int64_t d = 0; d < N;d+=bVec::size()) {
-        bVec x_ = bVec::loadu(output + m * 2 * N + d);
-        bVec y_ = bVec::loadu(output + m * 2 * N + N + d);
+        bVec x_ = bVec::loadu(my_output + m * 2 * N + d);
+        bVec y_ = bVec::loadu(my_output + m * 2 * N + N + d);
         x_ = x_ / (one + x_.neg().exp_u20());
         // mul
         x_ = x_ * y_;
         // convert
-        x_.store(output + m * 2 * N + d);
+        x_.store(output + m * N + d);
       }
     }
+    
+    // for (int64_t m = 0; m < M; m++) {
+    //   for (int64_t n = 0;n < N * 2; n++) {
+    //     if (n < N) {
+    //       out[m * N + n] = output[m * 2 * N + n];
+    //     }
+    //   }
+    // }
 // }
 // // });
     // printf("ic1 ");
