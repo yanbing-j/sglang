@@ -1677,6 +1677,7 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
+        print(self.server_args.enable_two_batch_overlap, not self.is_draft_worker)
         if self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:

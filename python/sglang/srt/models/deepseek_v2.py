@@ -69,7 +69,12 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutput,
+    TopKOutputFormat,
+)
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -715,7 +720,7 @@ class DeepseekV2MoE(nn.Module):
             state.router_logits = None
 
     def op_shared_experts(self, state):
-        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
+        hidden_states_mlp_input = state.hidden_states_mlp_input
         if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, hidden_states_mlp_input
         ):
@@ -727,10 +732,12 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
+        print("in op_select_experts ##############################3")
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
+                print("do topk #############################")
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
@@ -746,6 +753,33 @@ class DeepseekV2MoE(nn.Module):
             state.topk_weights_local = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
+
+    def op_prepare_experts(self, state):
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            state.hidden_states_shape = state.hidden_states_mlp_input.shape
+            state.hidden_states_device = state.hidden_states_mlp_input.device
+            state.hidden_states_dtype = state.hidden_states_mlp_input.dtype
+            topk_output = StandardTopKOutput(
+                topk_ids=state.pop("topk_idx_local").to(torch.int32),
+                topk_weights=state.pop("topk_weights_local"),
+                router_logits=None,
+            )
+            self._forward_prepare_result = self.experts.forward_prepare(
+                state.hidden_states_mlp_input,
+                topk_output,
+            )
+
+    def op_enqueue_experts(self, state):
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            state.cpu_experts_result = self.experts.forward_enqueue(
+                self._forward_prepare_result
+            )
+        else:
+            state.cpu_experts_result = None
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
@@ -789,6 +823,25 @@ class DeepseekV2MoE(nn.Module):
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
             )
+
+    def op_combine_heto_experts(self, state):
+        hidden_states_shape = state.pop("hidden_states_shape")
+        hidden_states_device = state.pop("hidden_states_device")
+        hidden_states_dtype = state.pop("hidden_states_dtype")
+        state.pop("hidden_states_mlp_input")
+        if (
+            state.forward_batch.forward_mode is not None
+        ) and not state.forward_batch.forward_mode.is_idle():
+            combined = self.experts.forward_routed_experts_combine(
+                hidden_states_shape=hidden_states_shape,
+                hidden_states_device=hidden_states_device,
+                hidden_states_dtype=hidden_states_dtype,
+                # gpu_result=state.pop("gpu_experts_result"),
+                cpu_result=state.pop("cpu_experts_result"),
+            )
+            state.hidden_states_after_combine = combined
+        else:
+            state.hidden_states_after_combine = None
 
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")

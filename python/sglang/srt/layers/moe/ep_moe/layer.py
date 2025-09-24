@@ -13,6 +13,7 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    is_tbo_enabled,
     should_use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.kernels import (
@@ -419,7 +420,11 @@ class EPMoEDispatchCPU(EPMoE):
         topk_output = StandardTopKOutput(
             topk_ids=topk_output.topk_ids.to(self.device),
             topk_weights=topk_output.topk_weights.to(self.device),
-            router_logits=topk_output.router_logits.to(self.device),
+            router_logits=(
+                topk_output.router_logits.to(self.device)
+                if topk_output.router_logits is not None
+                else None
+            ),
         )
         return StandardDispatchOutput(
             hidden_states=hidden_states.to(self.device), topk_output=topk_output
@@ -548,6 +553,215 @@ class EPMoEDispatchCPU(EPMoE):
         if not hasattr(self, "_stream"):
             self._stream = torch.cuda.Stream()
         return self._stream
+
+
+class EPMoETBOCPU(EPMoEDispatchCPU):
+    RANK_CPU = "C0"
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        gemm1_alpha: Optional[float] = None,
+        gemm1_clamp_limit: Optional[float] = None,
+        with_bias: bool = False,
+    ):
+        with torch.device(self.device):
+            super().__init__(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_fused_shared_experts=num_fused_shared_experts,
+                layer_id=layer_id,
+                top_k=top_k,
+                params_dtype=params_dtype,
+                quant_config=quant_config,
+                prefix=prefix,
+                activation=activation,
+                # apply_router_weight_on_input=apply_router_weight_on_input,
+                routed_scaling_factor=routed_scaling_factor,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_clamp_limit=gemm1_clamp_limit,
+                with_bias=with_bias,
+            )
+
+    def _init_cpu_resources(self, expert_map):
+        self.cpu_ep_count = sum(1 for x in expert_map.values() if x == self.RANK_CPU)
+        self.cpu_moe = None
+        self.cpu_stream = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        # op_shared_experts: Optional[Callable] = None,
+    ):
+        # hidden_states will be destroyed in the process, so we need to save its properties
+        # for later use
+        hidden_states_shape = hidden_states.shape
+        hidden_states_device = hidden_states.device
+        hidden_states_dtype = hidden_states.dtype
+        self.forward_prepare(hidden_states, topk_output)
+        cpu_result = self.forward_enqueue(self._forward_prepare_result)
+        result = super().forward_to_gpu(torch.device("cuda"), cpu_result)
+        # shared_output = None
+        # if op_shared_experts is not None:
+        # shared_output = op_shared_experts(hidden_states)
+        # gpu_result = self.forward_routed_experts_maybe_gpu(
+        #     hidden_states, router_logits  # here hidden_states will be destroyed
+        # )
+        # self.forward_routed_experts_sync(
+        #     hidden_states_device,
+        # )
+        # result = self.forward_routed_experts_combine(
+        #     hidden_states_shape,
+        #     hidden_states_device,
+        #     hidden_states_dtype,
+        #     gpu_result,
+        #     cpu_result,
+        # )
+        return result
+
+    def forward_prepare(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        self._forward_prepare_result = super().forward_prepare(
+            hidden_states, topk_output
+        )
+        return self._forward_prepare_result
+
+    def forward_enqueue(self, dispatch_output: StandardDispatchOutput):
+        return super().forward_enqueue(dispatch_output)
+
+    def forward_routed_experts_maybe_gpu(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ):
+        if self.num_experts_per_partition > 0:
+            return super().forward(hidden_states, router_logits)
+        return None
+
+    def select_experts(self, **kwargs):
+        topk_weights, topk_ids = None, None
+        if hasattr(self, "_forward_prepare_result"):
+            topk_weights, topk_ids = self._forward_prepare_result
+            # release buffer after reuse, currently it will only be used once
+            self._forward_prepare_result = (None, None)
+        if topk_weights is None or topk_ids is None:
+            topk_weights, topk_ids = select_experts(**kwargs)
+
+        if self.need_map_topk:
+            topk_ids = self.map_expertid_to_local_experts(topk_ids)
+        return topk_weights, topk_ids
+
+    def forward_routed_experts_sync(
+        self,
+        hidden_states_device,
+    ):
+        if self.cpu_moe:
+            self.cpu_moe.forward_sync(hidden_states_device)
+
+    def forward_routed_experts_combine(
+        self,
+        hidden_states_shape,
+        hidden_states_device,
+        hidden_states_dtype,
+        # gpu_result,
+        cpu_result,
+    ):
+        result = super().forward_to_gpu(hidden_states_device, cpu_result)
+
+        # if gpu_result is None:
+        #     if self.cpu_moe:
+        #         result = cpu_result_on_gpu
+        #     else:
+        #         result = torch.zeros(
+        #             hidden_states_shape,
+        #             dtype=hidden_states_dtype,
+        #             device=hidden_states_device,
+        #         )
+        # else:
+        #     if self.cpu_moe:
+        #         result = gpu_result + cpu_result_on_gpu
+        #     else:
+        #         result = gpu_result
+
+        return result
+
+    # def is_hosting_cpu(self):
+    #     return self.ep_rank == 0 and self.cpu_ep_count != 0
+
+    # def weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id):
+    #     if self.cpu_moe:
+    #         self.cpu_moe.weight_loader(
+    #             param, loaded_weight, weight_name, shard_id, expert_id
+    #         )
+
+    #     return super().weight_loader(
+    #         param, loaded_weight, weight_name, shard_id, expert_id
+    #     )
+
+    # def _try_load_expert_map(self, num_experts):
+    #     hetomap_env = os.environ.get("SGL_HETOFLOW_EXPERT_MAP", "")
+    #     if hetomap_env:
+    #         logger.info(f"Loading expert mapping from {hetomap_env}")
+    #         with open(hetomap_env, "r") as f:
+    #             mapping_plan = json.load(f)
+    #         # mapping_plan: {layer_id: {expert_id: rank_id, ...}, ...}
+    #         # Use self.layer_id to select the mapping for this layer
+    #         layer_map = mapping_plan.get(str(self.layer_id), None)
+    #         if layer_map is None:
+    #             raise ValueError(
+    #                 f"No expert mapping found for layer_id {self.layer_id} in {hetomap_env}"
+    #             )
+    #         # Convert keys to int if needed
+    #         assert isinstance(layer_map, list), "Expected layer_map to be a list"
+    #         assert (
+    #             len(layer_map) == num_experts
+    #         ), f"Expert map length mismatch expected {num_experts}, got {len(layer_map)}"
+    #         expert_map_plan = {i: layer_map[i] for i in range(num_experts)}
+    #         return expert_map_plan
+    #     return None
+
+    # def create_default_expert_map(self, num_experts, tp_size, num_gpu_experts):
+    #     expert_map_plan = self._try_load_expert_map(num_experts)
+    #     if expert_map_plan is None:
+    #         # half on CPU, other half set even on GPUs
+    #         ep_size = tp_size or get_tensor_model_parallel_world_size()
+    #         expert_map_plan = dict()
+    #         gpu_in_high_part = False
+    #         if num_gpu_experts < 0:
+    #             gpu_in_high_part = True
+    #             gpu_expert_total = -num_gpu_experts
+    #         else:
+    #             gpu_expert_total = num_gpu_experts
+    #         logger.debug(
+    #             f"create_default_expert_map, gpu_expert_total:{gpu_expert_total}"
+    #         )
+    #         if gpu_in_high_part:
+    #             gpu_range = range(num_experts - gpu_expert_total, num_experts)
+    #             cpu_range = range(0, num_experts - gpu_expert_total)
+    #         else:
+    #             gpu_range = range(0, gpu_expert_total)
+    #             cpu_range = range(gpu_expert_total, num_experts)
+    #         for e_id in cpu_range:
+    #             expert_map_plan[e_id] = self.RANK_CPU
+    #         for ep_rank, r in enumerate(np.array_split(list(gpu_range), ep_size)):
+    #             for e_id in r:
+    #                 expert_map_plan[int(e_id)] = ep_rank
+    #     return expert_map_plan
 
 
 class DeepEPMoE(EPMoE):
@@ -1135,6 +1349,8 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_expert_parallel_world_size() > 1:
         return EPMoE
     if run_moe_on_cpu:
+        if is_tbo_enabled():
+            return EPMoETBOCPU
         return EPMoEDispatchCPU
     return FusedMoE
 

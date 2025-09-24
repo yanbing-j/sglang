@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -7,6 +8,8 @@ from sglang.srt import operations
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.operations import Operation
+
+run_moe_on_cpu = bool(int(os.getenv("RUN_MOE_ON_CPU", "0")))
 
 
 @dataclass
@@ -34,23 +37,38 @@ class OperationsStrategy:
     ) -> "OperationsStrategy":
         layer_name = layers[0].__class__.__name__
         if layer_name == "DeepseekV2DecoderLayer":
-            return OperationsStrategy.concat(
-                [
-                    _compute_moe_deepseek_layer_operations_strategy_tbo(
-                        layer, forward_mode
-                    )
-                    for layer in layers
-                ]
-            )
+            if not run_moe_on_cpu:
+                return OperationsStrategy.concat(
+                    [
+                        _compute_moe_deepseek_layer_operations_strategy_tbo(
+                            layer, forward_mode
+                        )
+                        for layer in layers
+                    ]
+                )
+            else:
+                return OperationsStrategy.concat(
+                    [
+                        _compute_moe_deepseek_layer_operations_strategy_tbo_moe_cpu(
+                            layer, forward_mode
+                        )
+                        for layer in layers
+                    ]
+                )
         elif layer_name == "Qwen3MoeDecoderLayer":
-            return OperationsStrategy.concat(
-                [
-                    _compute_moe_qwen3_layer_operations_strategy_tbo(
-                        layer, forward_mode
-                    )
-                    for layer in layers
-                ]
-            )
+            if not run_moe_on_cpu:
+                return OperationsStrategy.concat(
+                    [
+                        _compute_moe_qwen3_layer_operations_strategy_tbo(
+                            layer, forward_mode
+                        )
+                        for layer in layers
+                    ]
+                )
+            else:
+                raise NotImplementedError(
+                    f"MoE CPU TBO not implemented for layer {layer_name} in forward mode {forward_mode}"
+                )
         else:
             raise NotImplementedError
 
@@ -207,5 +225,39 @@ def _compute_moe_qwen3_decode(layer):
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
             operations.YieldOperation(),
+        ],
+    )
+
+
+# -------------------------------- Strategy for MoE CPU TBO ---------------------------------------
+def _compute_moe_deepseek_layer_operations_strategy_tbo_moe_cpu(
+    layer: torch.nn.Module,
+    forward_mode: ForwardMode,
+) -> OperationsStrategy:
+    assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
+    return _compute_moe_deepseek_decode_moe_cpu(layer)
+
+
+def _compute_moe_deepseek_decode_moe_cpu(layer):
+    return OperationsStrategy(
+        tbo_delta_stages=1,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_comm_prepare_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            layer.mlp.op_prepare_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_enqueue_experts,
+            layer.mlp.op_shared_experts,
+            # layer.mlp.op_shared_experts_keep_state,
+            # operations.YieldOperation(),
+            # layer.mlp.op_sync_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_combine_heto_experts,
+            layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
         ],
     )
