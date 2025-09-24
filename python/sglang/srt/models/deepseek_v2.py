@@ -732,12 +732,10 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
-        print("in op_select_experts ##############################3")
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                print("do topk #############################")
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,

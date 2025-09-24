@@ -417,52 +417,60 @@ class EPMoEDispatchCPU(EPMoE):
         return self.forward_enqueue(dispatch_output)
 
     def forward_prepare(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        topk_output = StandardTopKOutput(
-            topk_ids=topk_output.topk_ids.to(self.device),
-            topk_weights=topk_output.topk_weights.to(self.device),
-            router_logits=(
-                topk_output.router_logits.to(self.device)
-                if topk_output.router_logits is not None
-                else None
-            ),
-        )
-        return StandardDispatchOutput(
-            hidden_states=hidden_states.to(self.device), topk_output=topk_output
-        )
+        if not torch.cuda.is_current_stream_capturing():
+            topk_output = StandardTopKOutput(
+                topk_ids=topk_output.topk_ids.to(self.device),
+                topk_weights=topk_output.topk_weights.to(self.device),
+                router_logits=(
+                    topk_output.router_logits.to(self.device)
+                    if topk_output.router_logits is not None
+                    else None
+                ),
+            )
+            return StandardDispatchOutput(
+                hidden_states=hidden_states.to(self.device), topk_output=topk_output
+            )
+        else:
+            return StandardDispatchOutput(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
 
     def forward_enqueue(self, dispatch_output: StandardDispatchOutput):
-        from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+        if not torch.cuda.is_current_stream_capturing():
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-        topk_weights, topk_ids, _ = topk_output
-        moe_runner_config = self.moe_runner_config
-        x, topk_weights = apply_topk_weights_cpu(
-            moe_runner_config.apply_router_weight_on_input, topk_weights, x
-        )
-        import sgl_kernel
-        from sgl_kernel_cpu import common_ops
+            x = dispatch_output.hidden_states
+            topk_output = dispatch_output.topk_output
+            topk_weights, topk_ids, _ = topk_output
+            moe_runner_config = self.moe_runner_config
+            x, topk_weights = apply_topk_weights_cpu(
+                moe_runner_config.apply_router_weight_on_input, topk_weights, x
+            )
+            import sgl_kernel
+            from sgl_kernel_cpu import common_ops
 
-        kernel = torch.ops.sgl_kernel
-        output = kernel.fused_experts_cpu(
-            x,
-            self.w13_weight,
-            self.w2_weight,
-            topk_weights,
-            topk_ids,
-            False,  # inplace # See [Note] inplace should be False in fused_experts.
-            False,  # use_int8_w8a8
-            True,  # use_fp8_w8a16
-            self.w13_weight_scale_inv,  # w1_scale
-            self.w2_weight_scale_inv,  # w2_scale
-            self.quant_config.weight_block_size,  # block_size
-            None,  # a1_scale
-            None,  # a2_scale
-            False,  # is_vnni
-        )
-        # return StandardCombineInput(hidden_states=output)
-        return output
+            kernel = torch.ops.sgl_kernel
+            output = kernel.fused_experts_cpu(
+                x,
+                self.w13_weight,
+                self.w2_weight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace # See [Note] inplace should be False in fused_experts.
+                False,  # use_int8_w8a8
+                True,  # use_fp8_w8a16
+                self.w13_weight_scale_inv,  # w1_scale
+                self.w2_weight_scale_inv,  # w2_scale
+                self.quant_config.weight_block_size,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                False,  # is_vnni
+            )
+            # return StandardCombineInput(hidden_states=output)
+            return output
         # return self.cpu_result[:n_tokens]
+        else:
+            return dispatch_output.hidden_states
 
     def forward_sync(self, hidden_states_device):
         self.cpu_infer.sync_with_cuda_stream(
