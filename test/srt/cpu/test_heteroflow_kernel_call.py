@@ -1,20 +1,20 @@
 import itertools
-
 import unittest
+
 # import cuda sgl-kernel
 import sgl_kernel
 import torch
+
 # import cpu amx sgl-kernel
 from sgl_kernel_cpu import common_ops
 
 kernel = torch.ops.sgl_kernel
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import outplace_fused_experts
 from sglang.srt.layers.moe.topk import fused_topk
+
 torch.manual_seed(1234)
 
-from utils import (
-    precision,
-)
+from utils import precision
 
 from sglang.test.test_utils import CustomTestCase
 
@@ -52,6 +52,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         prepack,
     )
 
+
 def torch_cuda_fused_moe(a, w1, w2, score, topk, renormalize):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
@@ -69,6 +70,7 @@ def torch_cuda_fused_moe(a, w1, w2, score, topk, renormalize):
         topk_weight,
         topk_ids,
     )
+
 
 class TestFusedExperts(CustomTestCase):
     M = [2, 114]
@@ -88,10 +90,11 @@ class TestFusedExperts(CustomTestCase):
         score = torch.randn((m, e), device="cpu", dtype=dtype)
 
         # calling cuda kernel (triton)
-        torch_output = torch_cuda_fused_moe(a.cuda(), w1.cuda(), w2.cuda(), score.cuda(), topk, renormalize)
+        torch_output = torch_cuda_fused_moe(
+            a.cuda(), w1.cuda(), w2.cuda(), score.cuda(), topk, renormalize
+        )
         # caling cpu amx kernel
         fused_output = fused_moe(a, w1, w2, score, topk, renormalize, prepack)
-
 
     def test_bf16_moe(self):
         for params in itertools.product(
@@ -111,6 +114,7 @@ class TestFusedExperts(CustomTestCase):
                 renormalize=params[5],
             ):
                 self._bf16_moe(*params)
+
 
 class TestTopK(CustomTestCase):
     def _run_single_test(self, M, E, topk, renormalize, dtype):
@@ -132,7 +136,6 @@ class TestTopK(CustomTestCase):
             hidden_states, gating_output, topk, renormalize
         )
 
-
     def test_topk(self):
         for renormalize in [True, False]:
             self._run_single_test(123, 8, 2, renormalize, torch.bfloat16)
@@ -143,6 +146,6 @@ class TestTopK(CustomTestCase):
             self._run_single_test(123, 256, 4, renormalize, torch.bfloat16)
             self._run_single_test(123, 160, 6, renormalize, torch.bfloat16)
 
+
 if __name__ == "__main__":
     unittest.main()
-
