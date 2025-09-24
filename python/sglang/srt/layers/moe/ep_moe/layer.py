@@ -23,7 +23,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.topk import TopKOutput, StandardTopKOutput
+from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -105,6 +106,7 @@ class EPMoE(FusedMoE):
         gemm1_clamp_limit: Optional[float] = None,
         with_bias: bool = False,
     ):
+        print("is EPMoe")
         super().__init__(
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -145,6 +147,7 @@ class EPMoE(FusedMoE):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, topk_output)
         else:
+            print("is EPMoE -> FusedMoE")
             return super().forward(hidden_states, topk_output)
 
     def forward_deepgemm(
@@ -331,6 +334,217 @@ class EPMoE(FusedMoE):
         if self.moe_runner_config.routed_scaling_factor is not None:
             output *= self.moe_runner_config.routed_scaling_factor
         return output
+
+
+class EPMoEDispatch(EPMoE):
+    device = "cuda"
+
+    def forward_start(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        print("in EPMoEDispatch forward_start")
+        self.stream.wait_stream(torch.cuda.current_stream())
+        topk_output = StandardTopKOutput(
+            topk_ids=topk_output.topk_ids.to(self.device),
+            topk_weights=topk_output.topk_weights.to(self.device),
+            router_logits=topk_output.router_logits.to(self.device),
+        )
+        with torch.cuda.stream(self.stream):
+            cpu_result = super().forward(
+                hidden_states.to(self.device),
+                topk_output,
+            )
+        return cpu_result
+
+    def forward_sync(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        result = self.forward_start(hidden_states, topk_output)
+        self.forward_sync()
+        return result
+
+    @property
+    def stream(self):
+        if not hasattr(self, "_stream"):
+            self._stream = torch.cuda.Stream()
+        return self._stream
+
+
+class EPMoEDispatchCPU(EPMoE):
+    device = "cpu"
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        gemm1_alpha: Optional[float] = None,
+        gemm1_clamp_limit: Optional[float] = None,
+        with_bias: bool = False,
+    ):
+        with torch.device(self.device):
+            super().__init__(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_fused_shared_experts=num_fused_shared_experts,
+                layer_id=layer_id,
+                top_k=top_k,
+                params_dtype=params_dtype,
+                quant_config=quant_config,
+                prefix=prefix,
+                activation=activation,
+                # apply_router_weight_on_input=apply_router_weight_on_input,
+                routed_scaling_factor=routed_scaling_factor,
+                gemm1_alpha=gemm1_alpha,
+                gemm1_clamp_limit=gemm1_clamp_limit,
+                with_bias=with_bias,
+            )
+
+    def forward_start(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        dispatch_output = self.forward_prepare(hidden_states, topk_output)
+        return self.forward_enqueue(dispatch_output)
+
+    def forward_prepare(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        topk_output = StandardTopKOutput(
+            topk_ids=topk_output.topk_ids.to(self.device),
+            topk_weights=topk_output.topk_weights.to(self.device),
+            router_logits=topk_output.router_logits.to(self.device),
+        )
+        return StandardDispatchOutput(
+            hidden_states=hidden_states.to(self.device), topk_output=topk_output
+        )
+
+    def forward_enqueue(self, dispatch_output: StandardDispatchOutput):
+        from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+        moe_runner_config = self.moe_runner_config
+        x, topk_weights = apply_topk_weights_cpu(
+            moe_runner_config.apply_router_weight_on_input, topk_weights, x
+        )
+        import sgl_kernel
+        from sgl_kernel_cpu import common_ops
+        kernel = torch.ops.sgl_kernel
+        output = kernel.fused_experts_cpu(
+            x,
+            self.w13_weight,
+            self.w2_weight,
+            topk_weights,
+            topk_ids,
+            False,  # inplace # See [Note] inplace should be False in fused_experts.
+            False,  # use_int8_w8a8
+            True,  # use_fp8_w8a16
+            self.w13_weight_scale_inv,  # w1_scale
+            self.w2_weight_scale_inv,  # w2_scale
+            self.quant_config.weight_block_size,  # block_size
+            None,  # a1_scale
+            None,  # a2_scale
+            False,  # is_vnni
+        )
+        # return StandardCombineInput(hidden_states=output)
+        return output
+        # return self.cpu_result[:n_tokens]
+
+    def forward_sync(self, hidden_states_device):
+        self.cpu_infer.sync_with_cuda_stream(
+            torch.cuda.current_stream(hidden_states_device).cuda_stream
+        )
+
+    def forward_to_gpu(self, hidden_states_device, cpu_result):
+        return cpu_result.to(hidden_states_device, non_blocking=True)
+
+    def create_cpu_tensors_if_needed_from_params(
+        self, hidden_size, topk, dtype, batchsize
+    ):
+        if self.cpu_hidden_states is None:
+            self.cpu_hidden_states_pool = [
+                torch.empty(
+                    (batchsize, hidden_size),
+                    dtype=dtype,
+                    device=self.device,
+                    pin_memory=True,
+                )
+                for _ in range(self.tensor_tbo_pool_size)
+            ]
+            self.cpu_sorted_topk_ids_pool = [
+                torch.empty(
+                    (batchsize, topk),
+                    dtype=torch.int32,
+                    device=self.device,
+                    pin_memory=True,
+                )
+                for _ in range(self.tensor_tbo_pool_size)
+            ]
+            self.cpu_sorted_topk_weights_pool = [
+                torch.empty(
+                    (batchsize, topk),
+                    dtype=torch.float32,
+                    device=self.device,
+                    pin_memory=True,
+                )
+                for _ in range(self.tensor_tbo_pool_size)
+            ]
+            self.cpu_result_pool = [
+                torch.empty(
+                    (batchsize, hidden_size),
+                    dtype=dtype,
+                    device=self.device,
+                    pin_memory=True,
+                )
+                for _ in range(self.tensor_tbo_pool_size)
+            ]
+            self._switch_to_next_tensor_set()
+
+    def _switch_to_next_tensor_set(self):
+        self.cpu_hidden_states = self.cpu_hidden_states_pool[
+            self.cpu_tensor_tbo_subbatch_id
+        ]
+        self.cpu_sorted_topk_ids = self.cpu_sorted_topk_ids_pool[
+            self.cpu_tensor_tbo_subbatch_id
+        ]
+        self.cpu_sorted_topk_weights = self.cpu_sorted_topk_weights_pool[
+            self.cpu_tensor_tbo_subbatch_id
+        ]
+        self.cpu_result = self.cpu_result_pool[self.cpu_tensor_tbo_subbatch_id]
+        self.cpu_tensor_tbo_subbatch_id = (
+            self.cpu_tensor_tbo_subbatch_id + 1
+        ) % self.tensor_tbo_pool_size
+
+    def fill_cpu_tensors(self, hidden_states, sorted_topk_ids, sorted_topk_weights):
+        bs = hidden_states.shape[0]
+        # TODO: cpu_moe_engine will crash if all topk_ids are -1
+        # below is a hack to prevent that, but we should fix it in cpu_moe_engine
+        # sorted_topk_ids[:, 0] = torch.max(
+        #     sorted_topk_ids[:, 0],
+        #     torch.zeros_like(sorted_topk_ids[:, 0]),
+        # )
+        assert bs <= self.cpu_hidden_states.shape[0]
+        self.cpu_hidden_states[:bs].copy_(hidden_states, non_blocking=True)
+        self.cpu_sorted_topk_ids[:bs].copy_(sorted_topk_ids, non_blocking=True)
+        self.cpu_sorted_topk_weights[:bs].copy_(sorted_topk_weights, non_blocking=True)
+
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        # return super().forward(hidden_states, topk_output)
+        result = self.forward_start(hidden_states, topk_output)
+        # self.forward_sync()
+        return self.forward_to_gpu(torch.device("cuda"), result)
+
+    @property
+    def stream(self):
+        if not hasattr(self, "_stream"):
+            self._stream = torch.cuda.Stream()
+        return self._stream
+
 
 
 class DeepEPMoE(EPMoE):
@@ -917,7 +1131,9 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         return FusedMoE
     if get_moe_expert_parallel_world_size() > 1:
         return EPMoE
-    return FusedMoE
+    return EPMoEDispatchCPU
+    # return EPMoEDispatch
+    # return EPMoE
 
 
 def copy_list_to_gpu_no_ce(arr: List[int]):
