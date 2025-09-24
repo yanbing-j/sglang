@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -23,8 +24,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     tma_align_input_scale,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFusedMoE, FusedMoE
-from sglang.srt.layers.moe.topk import TopKOutput, StandardTopKOutput
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -64,6 +65,8 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
 
 logger = logging.getLogger(__name__)
+
+run_moe_on_cpu = bool(int(os.getenv("RUN_MOE_ON_CPU", "0")))
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -434,6 +437,7 @@ class EPMoEDispatchCPU(EPMoE):
         )
         import sgl_kernel
         from sgl_kernel_cpu import common_ops
+
         kernel = torch.ops.sgl_kernel
         output = kernel.fused_experts_cpu(
             x,
@@ -544,7 +548,6 @@ class EPMoEDispatchCPU(EPMoE):
         if not hasattr(self, "_stream"):
             self._stream = torch.cuda.Stream()
         return self._stream
-
 
 
 class DeepEPMoE(EPMoE):
@@ -1131,9 +1134,9 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         return FusedMoE
     if get_moe_expert_parallel_world_size() > 1:
         return EPMoE
-    return EPMoEDispatchCPU
-    # return EPMoEDispatch
-    # return EPMoE
+    if run_moe_on_cpu:
+        return EPMoEDispatchCPU
+    return FusedMoE
 
 
 def copy_list_to_gpu_no_ce(arr: List[int]):
