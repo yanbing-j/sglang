@@ -618,7 +618,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 input_text, is_cross_encoder_request
             )
 
-        if self.mm_processor and obj.contains_mm_input():
+        # Check if we need to process multimodal inputs
+        # For Whisper models, only process MM inputs if there's actual audio/image/video data
+        should_process_mm = self.mm_processor and obj.contains_mm_input()
+
+        # Special case: For Whisper with text-only input, don't create multimodal inputs
+        # This allows pure text mode for Whisper models
+        if (
+            self.mm_processor
+            and self.mm_processor.__class__.__name__ == "WhisperProcessor"
+            and not obj.contains_mm_input()
+        ):
+            should_process_mm = False
+
+        if should_process_mm:
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
@@ -871,7 +884,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ) -> None:
         """Validate constraints for batch tokenization processing."""
         for i in range(batch_size):
-            if self.is_generation and obj[i].contains_mm_input():
+            # For Whisper models, only need multimodal processing if there's actual MM data
+            should_process_mm = self.is_generation and obj[i].contains_mm_input()
+            if should_process_mm:
                 raise ValueError(
                     "For multimodal input processing do not set `enable_tokenizer_batch_encode`."
                 )
@@ -891,6 +906,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         for i in range(batch_size):
             if obj[i].text:
                 return True
+            # For multimodal inputs, check if there's actual MM data
             elif self.is_generation and obj[i].contains_mm_input():
                 return True
 

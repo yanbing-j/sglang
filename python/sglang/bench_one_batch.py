@@ -350,6 +350,75 @@ def prepare_synthetic_inputs_for_latency_test(
     return reqs
 
 
+def add_whisper_multimodal_inputs(reqs, model_runner):
+    """Add dummy multimodal inputs for Whisper models"""
+    import torch
+
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+
+    print(f"🔍 add_whisper_multimodal_inputs called with {len(reqs)} reqs")
+
+    # Check if this is a Whisper model
+    model_config = getattr(model_runner, "model_config", None)
+    print(f"🔍 Model config: {model_config}")
+
+    # Try multiple ways to detect Whisper model
+    is_whisper = False
+
+    # Check 1: model_config.architectures
+    if model_config and hasattr(model_config, "architectures"):
+        print(f"🔍 Architectures: {model_config.architectures}")
+        if "WhisperForConditionalGeneration" in model_config.architectures:
+            is_whisper = True
+
+    # Check 2: model_config.model_type
+    elif model_config and hasattr(model_config, "model_type"):
+        print(f"🔍 Model type: {model_config.model_type}")
+        if "whisper" in model_config.model_type.lower():
+            is_whisper = True
+
+    # Check 3: model_runner.model class name
+    elif hasattr(model_runner, "model") and hasattr(model_runner.model, "__class__"):
+        model_class_name = model_runner.model.__class__.__name__
+        print(f"🔍 Model class name: {model_class_name}")
+        if "Whisper" in model_class_name:
+            is_whisper = True
+
+    # Check 4: model_config attributes
+    if model_config:
+        for attr in dir(model_config):
+            if not attr.startswith("_"):
+                value = getattr(model_config, attr, None)
+                print(f"  {attr}: {value}")
+
+    if is_whisper:
+        print("🎯 Detected Whisper model, adding dummy multimodal inputs...")
+
+        # Create dummy audio feature for each request
+        n_mels = 80  # Standard Whisper mel feature dimension
+        seq_len = 3000  # Default sequence length for Whisper
+
+        for i, req in enumerate(reqs):
+            dummy_audio_feature = torch.zeros((n_mels, seq_len), dtype=torch.float16)
+
+            mm_item = MultimodalDataItem(
+                feature=dummy_audio_feature,
+                modality=Modality.AUDIO,
+            )
+
+            req.multimodal_inputs = MultimodalInputs(mm_items=[mm_item])
+            req.multimodal_inputs.num_image_tokens = (
+                seq_len // 2
+            )  # Approximate token count
+            print(f"✅ Added multimodal inputs to req {i}")
+    else:
+        print(f"⚠️ Not a Whisper model, skipping multimodal inputs")
+
+
 @torch.no_grad
 def extend(reqs, model_runner):
     # Create dummy tree_cache for benchmarks (no prefix caching, just allocation)
@@ -459,6 +528,7 @@ def correctness_test(
     input_ids, reqs = prepare_inputs_for_correctness_test(
         bench_args, tokenizer, custom_prompts
     )
+    add_whisper_multimodal_inputs(reqs, model_runner)
     rank_print(f"\n{input_ids=}\n")
 
     if bench_args.cut_len > 0:
@@ -650,6 +720,9 @@ def latency_test(
         bench_args.batch_size[0], bench_args.input_len[0]
     )
 
+    # Add multimodal inputs for Whisper models
+    add_whisper_multimodal_inputs(reqs, model_runner)
+
     # Warm up
     rank_print("Warmup ...")
     latency_test_run_once(
@@ -702,6 +775,7 @@ def latency_test(
                 )
 
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+        add_whisper_multimodal_inputs(reqs, model_runner)
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,

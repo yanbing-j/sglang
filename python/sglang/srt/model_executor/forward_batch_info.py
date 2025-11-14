@@ -479,6 +479,7 @@ class ForwardBatch:
             if none, current batch contains no multimodal input
 
         """
+        print(self.mm_inputs)
         if not self.mm_inputs or all(x is None for x in self.mm_inputs):
             return None
         # Filter out None values

@@ -399,8 +399,22 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        image_inputs.num_image_tokens = image_inputs.mm_items[0].feature.shape[1] // 2
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        # Calculate the number of audio tokens based on the feature dimension
+        # For Whisper, the audio features are processed by the encoder
+        if mm_inputs and mm_inputs.mm_items:
+            # For Whisper, calculate the encoded sequence length based on features
+            feature = mm_inputs.mm_items[0].feature
+            if feature.shape[1] <= 16 and torch.all(
+                feature == 0
+            ):  # This is our dummy feature for text-only
+                mm_inputs.num_image_tokens = 0  # No actual audio content
+            else:
+                # Real audio features: use the downsampled length
+                # The Whisper encoder conv2 has stride=2, so sequence length is halved
+                mm_inputs.num_image_tokens = feature.shape[1] // 2
+        else:
+            mm_inputs.num_image_tokens = 0
         # Whisper models handle text/audio separately, so we don't need to pad input ids
         return input_ids
 
@@ -413,17 +427,33 @@ class WhisperForConditionalGeneration(torch.nn.Module):
     ) -> LogitsProcessorOutput:
 
         mm_inputs = forward_batch.merge_mm_inputs()
-        assert mm_inputs is not None
-        features = mm_inputs.mm_items[0].feature
-        dtype = self.encoder.conv1.weight.dtype
 
-        encoder_position_ids = torch.cat(
-            [torch.arange(length) for length in forward_batch.encoder_lens_cpu]
-        ).to(features.device, non_blocking=True)
+        # For text-only inputs, create minimal encoder output
+        if mm_inputs is None or sum(forward_batch.encoder_lens_cpu) == 0:
+            # Pure text mode - create minimal encoder output for decoder compatibility
+            device = self.decoder.embed_tokens.weight.device
+            dtype = self.decoder.embed_tokens.weight.dtype
+            hidden_size = self.config.d_model
+            # Create a single dummy encoder token to avoid empty sequence issues
+            encoder_outputs = torch.zeros((1, hidden_size), device=device, dtype=dtype)
+        else:
+            # Normal audio processing path
+            assert (
+                mm_inputs is not None
+            ), "mm_inputs cannot be None when encoder_lens > 0"
+            features = mm_inputs.mm_items[0].feature
+            dtype = self.encoder.conv1.weight.dtype
 
-        encoder_outputs = self.encoder(
-            features.to(dtype), encoder_position_ids, forward_batch
-        )
+            # Move features to the same device as the model
+            features = features.to(device=self.encoder.conv1.weight.device, dtype=dtype)
+
+            encoder_position_ids = torch.cat(
+                [torch.arange(length) for length in forward_batch.encoder_lens_cpu]
+            ).to(features.device, non_blocking=True)
+
+            encoder_outputs = self.encoder(
+                features, encoder_position_ids, forward_batch
+            )
         decoder_outputs = self.decoder(
             input_ids, encoder_outputs, forward_batch, positions
         )
