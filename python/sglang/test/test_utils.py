@@ -37,6 +37,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_cpu,
     is_cuda,
     is_xpu,
     kill_process_tree,
@@ -1701,6 +1702,11 @@ def run_and_check_memory_leak(
         other_args += ["--enable-mixed-chunk"]
     if disable_overlap:
         other_args += ["--disable-overlap-schedule"]
+    if is_cpu():
+        # On CPU the KV cache estimation can claim almost all system RAM
+        # (mem_fraction_static ≈ 0.99), triggering the OOM killer.
+        # Use a small static fraction so the test stays within bounds.
+        other_args += ["--mem-fraction-static", "0.1"]
 
     model = DEFAULT_MODEL_NAME_FOR_TEST
     port = random.randint(4000, 5000)
