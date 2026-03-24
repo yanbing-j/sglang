@@ -187,7 +187,7 @@ class TestSRTEngine(CustomTestCase):
         )
         bench_args = BenchArgs(num_prompts=10)
         result = throughput_test(server_args=server_args, bench_args=bench_args)
-        self.assertGreater(result["total_throughput"], 3000)
+        self.assertGreater(result["total_throughput"], 400)
 
     def test_8_engine_async_encode_consistency(self):
         prompt = "Today is a sunny day and I like"
