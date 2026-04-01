@@ -2587,9 +2587,17 @@ class ServerArgs:
                     "Please use --mamba-scheduler-strategy no_buffer instead."
                 )
 
+            if not is_cuda():
+                logger.warning(
+                    "Mamba extra_buffer is only supported on CUDA devices. "
+                    "Ignoring --mamba-scheduler-strategy extra_buffer on current hardware."
+                )
+                self.mamba_scheduler_strategy = "no_buffer"
+                return
             assert (
                 is_cuda() or is_musa() or is_npu()
             ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
+
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
