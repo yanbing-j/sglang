@@ -66,6 +66,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         None,
         None,
         None,
+        None,
         prepack,
     )
 
@@ -121,6 +122,7 @@ class TestFusedExperts(CustomTestCase):
             None,  # w2_scale
             None,  # w1_zp
             None,  # w2_zp
+            None,  # a1_scale
             None,  # block_size
             w1_b,
             w2_b,
@@ -185,6 +187,7 @@ class TestFusedExperts(CustomTestCase):
             None,
             None,
             None,
+            None,
             prepack,
         )
 
@@ -240,6 +243,7 @@ class TestFusedExperts(CustomTestCase):
             w2s,
             None,
             None,
+            None,
             [BLOCK_N, BLOCK_K],
             None,
             None,
@@ -289,6 +293,7 @@ class TestFusedExperts(CustomTestCase):
             CPUQuantMethod.MXFP4,
             w1s,
             w2s,
+            None,
             None,
             None,
             None,
@@ -355,6 +360,7 @@ class TestFusedExperts(CustomTestCase):
             w2s,  # w2_scale
             None,  # w1_zp
             None,  # w2_zp
+            None,  # a1_scale
             None,  # block_size
             w1_b,
             w2_b,
@@ -424,6 +430,7 @@ class TestFusedExperts(CustomTestCase):
             awq_w2_scales_pack,
             awq_w13_zero_pack,
             awq_w2_zero_pack,
+            None,
             None,
             None,
             None,
