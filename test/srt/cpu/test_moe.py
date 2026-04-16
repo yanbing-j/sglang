@@ -57,6 +57,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         None,
         None,
         None,
+        None,
         prepack,
     )
 
@@ -170,6 +171,7 @@ class TestFusedExperts(CustomTestCase):
             None,
             None,
             None,
+            None,
             prepack,
         )
 
@@ -239,6 +241,7 @@ class TestFusedExperts(CustomTestCase):
             CPUQuantMethod.FP8_W8A16,
             w1s,
             w2s,
+            None,
             None,
             None,
             [BLOCK_N, BLOCK_K],
@@ -323,6 +326,7 @@ class TestFusedExperts(CustomTestCase):
             awq_w2_scales_pack,
             awq_w13_zero_pack,
             awq_w2_zero_pack,
+            None,
             None,
             True,
         )
