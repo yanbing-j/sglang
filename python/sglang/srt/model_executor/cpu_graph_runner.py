@@ -232,10 +232,6 @@ def register_fake_ops(tp_size: int):
         w2_zero,
         a1_scale,
         block_size,
-        w1_bias,
-        w2_bias,
-        alpha,
-        limit,
         is_vnni,
         activation=None,
     ):
@@ -260,7 +256,6 @@ def register_fake_ops(tp_size: int):
         q_a_proj_scale,
         q_b_proj_scale,
         kv_a_proj_scale,
-        w_scale,
         is_vnni,
         block_size,
     ):
@@ -622,7 +617,11 @@ def register_fake_ops(tp_size: int):
         M = input.shape[0]
         K = input.shape[1]
         act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
-        scale = input.new_empty(M, dtype=torch.float) if channelwise else input.new_empty(1, dtype=torch.float)
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
         return act_quant, scale
 
     @torch.library.register_fake("sgl_kernel::quantize_fp8e4m3")
@@ -634,8 +633,13 @@ def register_fake_ops(tp_size: int):
         M = input.shape[0]
         K = input.shape[1]
         act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
-        scale = input.new_empty(M, dtype=torch.float) if channelwise else input.new_empty(1, dtype=torch.float)
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
         return act_quant, scale
+
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.
