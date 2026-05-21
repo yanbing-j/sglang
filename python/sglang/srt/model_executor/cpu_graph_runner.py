@@ -133,7 +133,6 @@ def register_fake_ops():
     for op in [
         "rmsnorm_cpu",
         "l2norm_cpu",
-        "fused_experts_cpu",
         "fused_rmsnorm_gated_cpu",
         "shared_expert_cpu",
         "causal_conv1d_update_cpu",
@@ -146,6 +145,28 @@ def register_fake_ops():
         @torch.library.register_fake(f"sgl_kernel::{op}")
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @torch.library.register_fake(f"sgl_kernel::fused_experts_cpu")
+    def _(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        inplace,
+        moe_comp_method,
+        w1_scale,
+        w2_scale,
+        w1_zero,
+        w2_zero,
+        a1_scale,
+        block_size,
+        is_vnni,
+        activation=None,
+    ):
+        if inplace:
+            return hidden_states
+        return torch.empty_like(hidden_states, dtype=torch.bfloat16)
 
     @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope")
     def _(
