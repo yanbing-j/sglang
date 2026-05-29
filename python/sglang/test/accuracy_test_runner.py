@@ -89,6 +89,7 @@ def _run_simple_eval(
     top_k: Optional[int] = None,
     repeat: Optional[int] = None,
     api: Optional[str] = None,
+    skip_server_launch: bool = False,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
 
@@ -97,13 +98,14 @@ def _run_simple_eval(
     """
     process = None
     try:
-        process = popen_launch_server(
-            model.model_path,
-            base_url,
-            other_args=model.extra_args,
-            timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env=model.env,
-        )
+        if not skip_server_launch:
+            process = popen_launch_server(
+                model.model_path,
+                base_url,
+                other_args=model.extra_args,
+                timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                env=model.env,
+            )
 
         args = SimpleNamespace(
             base_url=base_url,
@@ -451,6 +453,7 @@ def run_accuracy_test(
     model: ModelLaunchSettings,
     params: AccuracyTestParams,
     base_url: Optional[str] = None,
+    skip_server_launch: bool = False,
 ) -> AccuracyTestResult:
     """Run accuracy test for a single model.
 
@@ -498,6 +501,7 @@ def run_accuracy_test(
             top_k=params.top_k,
             repeat=params.repeat,
             api=params.api,
+            skip_server_launch=skip_server_launch,
         )
 
     if not success:
