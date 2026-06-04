@@ -124,6 +124,10 @@ if("$ENV{SGLANG_CPU_FP8_BRGEMM}" STREQUAL "1")
     add_compile_definitions(SGLANG_CPU_FP8_BRGEMM)
 endif()
 
+if(NOT DEFINED ENV{SGLANG_CPU_AVX10_2})
+    set(ENV{SGLANG_CPU_AVX10_2} "1")
+endif()
+
 if(MY_ARCH_DIR STREQUAL "x86_64")
     add_compile_options(
         -O3
@@ -136,6 +140,11 @@ if(MY_ARCH_DIR STREQUAL "x86_64")
         -mamx-int8
         -fopenmp
     )
+    if("$ENV{SGLANG_CPU_AVX10_2}" STREQUAL "0")
+        message(STATUS "AVX10.2 disabled")
+    else()
+        add_compile_options(-mavx10.2)
+    endif()
 else()
     add_compile_options(
         -O3
