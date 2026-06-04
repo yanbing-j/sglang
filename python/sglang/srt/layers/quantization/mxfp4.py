@@ -1134,6 +1134,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         if use_intel_amx_backend(layer):
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
@@ -1152,12 +1153,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale,  # w2_scale
                 None,  # w1_zp
                 None,  # w2_zp
+                None,  # a1_scale
                 None,  # block_size
-                getattr(layer, "w13_weight_bias", None),
-                getattr(layer, "w2_weight_bias", None),
-                layer.moe_runner_config.gemm1_alpha,
-                layer.moe_runner_config.gemm1_clamp_limit,
+                getattr(layer, "w13_weight_bias", None),  # w1_bias
+                getattr(layer, "w2_weight_bias", None),  # w2_bias
+                layer.moe_runner_config.gemm1_alpha,  # alpha
+                layer.moe_runner_config.gemm1_clamp_limit,  # limit
                 True,  # is_vnni
+                self.moe_runner_config.activation,  # activation
             )
             return StandardCombineInput(hidden_states=output)
 

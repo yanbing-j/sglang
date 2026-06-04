@@ -39,7 +39,11 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
+
+try:
+    from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
+except (ImportError, ModuleNotFoundError):
+    fused_softcap = None
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     get_token_ids_logprobs_chunk,
@@ -865,7 +869,7 @@ class LogitsProcessor(nn.Module):
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
         if self.final_logit_softcapping:
-            if not _is_npu:
+            if not _is_npu and not _is_cpu:
                 fused_softcap(logits, self.final_logit_softcapping)
             else:
                 logits = self.final_logit_softcapping * torch.tanh(
@@ -1098,3 +1102,4 @@ class LogitsProcessor(nn.Module):
             # They should be moved to GenerationBatchResult to keep this class clean.
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
+

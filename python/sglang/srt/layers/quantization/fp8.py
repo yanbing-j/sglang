@@ -2051,6 +2051,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     None,  # alpha
                     None,  # limit
                     True,  # is_vnni
+                    moe_runner_config.activation,  # activation
                 )
             else:
                 x_q, x_s = torch.ops.sgl_kernel._quantize_fp8e4m3_vec(x, True, None)
@@ -2073,6 +2074,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     None,  # alpha
                     None,  # limit
                     True,  # is_vnni
+                    moe_runner_config.activation,  # activation
                 )
             return StandardCombineInput(hidden_states=output)
 

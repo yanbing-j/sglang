@@ -213,6 +213,7 @@ class DeepseekMoE(nn.Module):
                 None,  # alpha
                 None,  # limit
                 True,  # is_vnni
+                "silu",  # activation
             )
         else:
             final_hidden_states = fused_moe(

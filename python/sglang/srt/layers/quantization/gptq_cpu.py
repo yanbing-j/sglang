@@ -369,11 +369,13 @@ class GPTQMoEIntelAMXMethod(FusedMoEMethodBase):
             layer.w2_scales,  # w2_scale
             layer.w13_qzeros,
             layer.w2_qzeros,
+            None,  # a1_scale
             None,  # block_size
             None,  # w1 bias
             None,  # w3 bias
             None,  # alpha
             None,  # limit
             True,  # is_vnni
+            "silu",  # activation
         )
         return StandardCombineInput(hidden_states=output)
