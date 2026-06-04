@@ -1128,12 +1128,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_scale,  # w2_scale
                     None,  # w1_zp
                     None,  # w2_zp
+                    None,  # a1_scale
                     None,  # block_size
                     getattr(layer, "w13_weight_bias", None),
                     getattr(layer, "w2_weight_bias", None),
                     layer.moe_runner_config.gemm1_alpha,
                     layer.moe_runner_config.gemm1_clamp_limit,
                     True,  # is_vnni
+                    self.moe_runner_config.activation,  # activation
                 )
             else:
                 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
