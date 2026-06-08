@@ -285,7 +285,7 @@ def register_fake_ops(tp_size: int):
         mrope_interleaved,
         is_neox,
     ):
-        return query, key
+        return  # void op: modifies query and key in-place, schema is -> ()
 
     @register_cpu_compile_fake("qkv_proj_with_rope_fused_weight")
     def _(
@@ -604,7 +604,11 @@ def register_fake_ops(tp_size: int):
         M = input.shape[0]
         K = input.shape[1]
         act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
-        scale = input.new_empty(M, dtype=torch.float) if channelwise else input.new_empty(1, dtype=torch.float)
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
         return act_quant, scale
 
     @torch.library.register_fake("sgl_kernel::quantize_fp8e4m3")
@@ -616,8 +620,13 @@ def register_fake_ops(tp_size: int):
         M = input.shape[0]
         K = input.shape[1]
         act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
-        scale = input.new_empty(M, dtype=torch.float) if channelwise else input.new_empty(1, dtype=torch.float)
+        scale = (
+            input.new_empty(M, dtype=torch.float)
+            if channelwise
+            else input.new_empty(1, dtype=torch.float)
+        )
         return act_quant, scale
+
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.
