@@ -161,6 +161,10 @@ def register_fake_ops():
         w2_zero,
         a1_scale,
         block_size,
+        w1_bias,
+        w2_bias,
+        alpha,
+        limit,
         is_vnni,
         activation=None,
     ):
