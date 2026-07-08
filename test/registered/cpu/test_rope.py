@@ -79,8 +79,8 @@ class TestROPE(CustomTestCase):
                     key=k,
                     positions=positions,
                 )
-                # fused rope kernel
-                q_sgl, k_sgl = torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+                # fused rope kernel (updates q_clone/k_clone in place, returns ())
+                torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
                     positions,
                     q_clone,
                     k_clone,
@@ -90,6 +90,7 @@ class TestROPE(CustomTestCase):
                     rope.mrope_interleaved,
                     is_neox_style,
                 )
+                q_sgl, k_sgl = q_clone, k_clone
                 atol = rtol = precision[q_ref.dtype]
                 torch.testing.assert_close(q_ref, q_sgl, atol=atol, rtol=rtol)
                 torch.testing.assert_close(k_ref, k_sgl, atol=atol, rtol=rtol)
