@@ -9,7 +9,16 @@ from .paged_mqa_logits import (
 
 if not is_hip():
     # Preserve the original eager import behavior on non-ROCm platforms.
-    from .cutedsl_paged_mqa_logits import CuteDSLPagedMQALogitsRunner, pick_dsl_expand
+    # CPU-only environments (pyproject_cpu.toml) do not ship nvidia-cutlass-dsl;
+    # fall back to None there, matching the ROCm behavior. Callers assert at use.
+    try:
+        from .cutedsl_paged_mqa_logits import (
+            CuteDSLPagedMQALogitsRunner,
+            pick_dsl_expand,
+        )
+    except ImportError:
+        CuteDSLPagedMQALogitsRunner = None
+        pick_dsl_expand = None
 
 __all__ = [
     "CuteDSLPagedMQALogitsRunner",
