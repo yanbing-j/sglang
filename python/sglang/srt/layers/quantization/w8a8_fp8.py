@@ -25,7 +25,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    set_weight_attrs,
+    use_intel_amx_backend,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -34,6 +39,8 @@ if TYPE_CHECKING:
     )
 
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class W8A8Fp8Config(QuantizationConfig):
@@ -108,6 +115,38 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight
+
+        if _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "W8A8Fp8LinearMethod on CPU requires AMX support"
+            layer.use_intel_amx_backend = True
+            if self.quantization_config.is_checkpoint_fp8_serialized:
+                weight_scale = layer.weight_scale.detach()
+                if _is_fp8_fnuz:
+                    weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                        weight=weight, weight_scale=weight_scale
+                    )
+            else:
+                # Per-channel fp8 quantization in pure PyTorch (Triton not available on CPU)
+                fp8_max = torch.finfo(fp8_dtype).max
+                eps = torch.finfo(torch.float32).eps
+                w_f32 = weight.float()
+                weight_scale = (
+                    w_f32.abs().amax(dim=-1, keepdim=True) / fp8_max
+                ).clamp(min=eps)
+                weight = (w_f32 / weight_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+                layer.input_scale = None
+            # weight: [N, K] fp8, weight_scale: [N, 1] float32
+            packed_weight, packed_scales = (
+                torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+                    weight.contiguous(),
+                    weight_scale.to(torch.float32).contiguous(),
+                )
+            )
+            layer.weight = Parameter(packed_weight, requires_grad=False)
+            layer.weight_scale = Parameter(packed_scales, requires_grad=False)
+            return
 
         if self.quantization_config.is_checkpoint_fp8_serialized:
             weight_scale = layer.weight_scale.detach()
@@ -185,6 +224,16 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
+        if use_intel_amx_backend(layer):
+            return torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+                x,
+                None,  # act_scales=None: dynamic per-token quantization
+                True,  # channelwise=True: per-token (PER_ROW)
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+            )
         return apply_fp8_linear(
             x,
             layer.weight,

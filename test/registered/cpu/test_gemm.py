@@ -275,6 +275,56 @@ class TestGemm(CustomTestCase):
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
 
+    @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
+    def test_fp8_w8a8_gemm(self, M, N, K, has_bias):
+        """Test fp8_scaled_mm_with_quant matches unfused _quantize_fp8e4m3_vec + float8_linear_cpu.
+
+        We use the kernel's own quantization op as the reference to avoid mismatches
+        from different fp32->fp8 rounding conventions (custom AVX512 intrinsic vs PyTorch).
+        """
+        dtype = torch.bfloat16
+        fp8_max = 448.0
+        eps = torch.finfo(torch.float32).eps
+
+        act = torch.randn(M, K, dtype=dtype)
+        weight = torch.randn(N, K, dtype=torch.float32)
+
+        # Per-channel weight quantization
+        weight_scale = (weight.abs().amax(dim=-1, keepdim=True) / fp8_max).clamp(
+            min=eps
+        )
+        weight_fp8 = (
+            (weight / weight_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        )
+
+        # Pack weight for CPU (float8_linear_prepack_cpu expects [N, K] weight and [N, 1] scale)
+        packed_weight, packed_scales = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+            weight_fp8, weight_scale.to(torch.float32)
+        )
+
+        bias = torch.randn(N, dtype=torch.float32) if has_bias else None
+
+        # Reference: use the kernel's own act quantization op + float8_linear_cpu (unfused path).
+        # This ensures both ref and out use the same fp32->fp8 rounding implementation.
+        act_fp8, act_scale = torch.ops.sgl_kernel._quantize_fp8e4m3_vec(act, True, None)
+        ref = torch.ops.sgl_kernel.float8_linear_cpu(
+            act_fp8, act_scale, packed_weight, packed_scales, bias, dtype
+        )
+
+        # Fused path: quantize activation internally then run GEMM
+        out = torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+            act,
+            None,  # act_scales=None: dynamic per-token
+            True,  # channelwise=True: per-token (PER_ROW)
+            packed_weight,
+            packed_scales,
+            bias,
+            dtype,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
     @parametrize(
         M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
     )
