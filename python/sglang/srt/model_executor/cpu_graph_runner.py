@@ -672,6 +672,23 @@ def register_fake_ops(tp_size: int):
         scale = input.new_empty(scale_shape, dtype=torch.float)
         return act_quant, scale
 
+    @torch.library.register_fake("sgl_kernel::scaled_fp8_quant_cpu")
+    def _(
+        input,
+        scale,
+        num_token_padding,
+        use_per_token_if_dynamic,
+    ):
+        output_rows = max(num_token_padding, input.shape[0])
+        act_quant = input.new_empty(
+            (output_rows, input.shape[1]), dtype=torch.float8_e4m3fn
+        )
+        if scale is not None:
+            return act_quant, scale
+        scale_shape = (output_rows, 1) if use_per_token_if_dynamic else (1,)
+        scale = input.new_empty(scale_shape, dtype=torch.float)
+        return act_quant, scale
+
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.

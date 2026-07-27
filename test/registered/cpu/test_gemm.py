@@ -18,6 +18,7 @@ from sglang.test.cpu_test_utils import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
+    scaled_fp8_quant,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -362,6 +363,56 @@ class TestGemm(CustomTestCase):
 
             torch.testing.assert_close(scale, expected_scale)
             torch.testing.assert_close(quantized.float(), expected_quantized.float())
+
+    def test_scaled_fp8_quant_cpu(self):
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+        for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            x = (torch.randn(5, 19, dtype=dtype) * 13).contiguous()
+
+            quantized, scale = scaled_fp8_quant(x)
+            expected_scale = x.float().abs().amax().clamp_min(1e-12) / fp8_max
+            expected_quantized = (
+                (x.float() / expected_scale)
+                .clamp(-fp8_max, fp8_max)
+                .to(torch.float8_e4m3fn)
+            )
+            self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
+            self.assertEqual(scale.dtype, torch.float32)
+            self.assertEqual(quantized.shape, x.shape)
+            torch.testing.assert_close(scale, expected_scale.reshape(1))
+            torch.testing.assert_close(quantized.float(), expected_quantized.float())
+
+            quantized_static, returned_scale = scaled_fp8_quant(x, scale)
+            self.assertIs(returned_scale, scale)
+            torch.testing.assert_close(
+                quantized_static.float(), expected_quantized.float()
+            )
+
+            quantized_padded, scale_padded = scaled_fp8_quant(
+                x, None, num_token_padding=8
+            )
+            self.assertEqual(quantized_padded.shape, (8, 19))
+            torch.testing.assert_close(scale_padded, scale)
+            torch.testing.assert_close(
+                quantized_padded[: x.shape[0]].float(), quantized.float()
+            )
+
+            per_token_quantized, per_token_scale = scaled_fp8_quant(
+                x, None, use_per_token_if_dynamic=True
+            )
+            expected_per_token_scale = (
+                x.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / fp8_max
+            )
+            expected_per_token_quantized = (
+                (x.float() / expected_per_token_scale)
+                .clamp(-fp8_max, fp8_max)
+                .to(torch.float8_e4m3fn)
+            )
+            torch.testing.assert_close(per_token_scale, expected_per_token_scale)
+            torch.testing.assert_close(
+                per_token_quantized.float(), expected_per_token_quantized.float()
+            )
 
     @parametrize(
         M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]

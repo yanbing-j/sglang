@@ -1875,6 +1875,14 @@ else:
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        if _is_cpu:
+            return torch.ops.sgl_kernel.scaled_fp8_quant_cpu(
+                input.contiguous(),
+                scale,
+                num_token_padding or 0,
+                use_per_token_if_dynamic,
+            )
+
         shape = input.shape
         if num_token_padding:
             shape = (max(num_token_padding, input.shape[0]), shape[1])

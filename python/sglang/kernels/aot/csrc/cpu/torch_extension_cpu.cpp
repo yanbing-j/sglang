@@ -473,6 +473,11 @@ std::tuple<at::Tensor, at::Tensor>
 _quantize_fp8e4m3(const at::Tensor& t, bool channelwise, c10::optional<at::Tensor> scale_opt = c10::nullopt);
 std::tuple<at::Tensor, at::Tensor>
 per_token_group_quant_fp8_cpu(const at::Tensor& input, int64_t group_size, double eps);
+std::tuple<at::Tensor, at::Tensor> scaled_fp8_quant_cpu(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& scale_opt,
+    int64_t num_token_padding,
+    bool use_per_token_if_dynamic);
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
@@ -602,6 +607,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("_quantize_fp8e4m3_vec", torch::kCPU, &_quantize_fp8e4m3_vec);
   m.def("per_token_group_quant_fp8_cpu(Tensor input, int group_size, float eps) -> (Tensor, Tensor)");
   m.impl("per_token_group_quant_fp8_cpu", torch::kCPU, &per_token_group_quant_fp8_cpu);
+  m.def(
+      "scaled_fp8_quant_cpu(Tensor input, Tensor? scale, int num_token_padding, bool use_per_token_if_dynamic) -> "
+      "(Tensor, Tensor)");
+  m.impl("scaled_fp8_quant_cpu", torch::kCPU, &scaled_fp8_quant_cpu);
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
   m.impl("silu_and_mul_cpu", torch::kCPU, &silu_and_mul_cpu);

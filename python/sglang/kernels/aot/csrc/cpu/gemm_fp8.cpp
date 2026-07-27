@@ -1166,6 +1166,168 @@ per_token_group_quant_fp8_cpu(const at::Tensor& input, int64_t group_size, doubl
 
   return std::make_tuple(quantized, scale);
 }
+template <typename scalar_t>
+void quantize_fp8e4m3_cpu_kernel(
+    const scalar_t* __restrict__ input_data,
+    at::Float8_e4m3fn* __restrict__ output_data,
+    int64_t num_elements,
+    float scale) {
+  constexpr float quant_max = 448.0f;
+  constexpr float neg_quant_max = -quant_max;
+  const float inv_scale = 1.0f / scale;
+  const __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+  const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+  const __m512 neg_quant_max_vec = _mm512_set1_ps(neg_quant_max);
+
+  at::parallel_for(0, num_elements, 1024, [&](int64_t begin, int64_t end) {
+    int64_t element_index = begin;
+    for (; element_index <= end - 16; element_index += 16) {
+      __m512 value_vec = load_16_as_fp32(input_data + element_index);
+      __m512 scaled_vec = _mm512_mul_ps(value_vec, inv_scale_vec);
+      __m512 clamped_vec = _mm512_min_ps(_mm512_max_ps(scaled_vec, neg_quant_max_vec), quant_max_vec);
+      __m128i fp8_vec = cvtfp32_fp8e4m3(clamped_vec);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(output_data + element_index), fp8_vec);
+    }
+
+    if (element_index < end) {
+      alignas(64) float tail_values[16] = {0.0f};
+      const int64_t tail_size = end - element_index;
+      for (int64_t tail_index = 0; tail_index < tail_size; ++tail_index) {
+        const float value = static_cast<float>(input_data[element_index + tail_index]) * inv_scale;
+        tail_values[tail_index] = std::clamp(value, neg_quant_max, quant_max);
+      }
+      __m512 tail_vec = _mm512_load_ps(tail_values);
+      __m128i tail_fp8_vec = cvtfp32_fp8e4m3(tail_vec);
+      alignas(16) uint8_t tail_fp8[16];
+      _mm_store_si128(reinterpret_cast<__m128i*>(tail_fp8), tail_fp8_vec);
+      uint8_t* output_tail = reinterpret_cast<uint8_t*>(output_data + element_index);
+      for (int64_t tail_index = 0; tail_index < tail_size; ++tail_index) {
+        output_tail[tail_index] = tail_fp8[tail_index];
+      }
+    }
+  });
+}
+
+template <typename scalar_t>
+float dynamic_per_tensor_scaled_fp8_quant_cpu_kernel(
+    const scalar_t* __restrict__ input_data, at::Float8_e4m3fn* __restrict__ output_data, int64_t num_elements) {
+  constexpr float quant_max = 448.0f;
+  constexpr float eps = 1.0e-12f;
+  const __m512 sign_bit = _mm512_set1_ps(-0.0f);
+  float absmax = 0.0f;
+  __m512 absmax_vec = _mm512_setzero_ps();
+
+  int64_t element_index = 0;
+  for (; element_index <= num_elements - 16; element_index += 16) {
+    __m512 value_vec = load_16_as_fp32(input_data + element_index);
+    __m512 abs_vec = _mm512_andnot_ps(sign_bit, value_vec);
+    absmax_vec = _mm512_max_ps(absmax_vec, abs_vec);
+  }
+  absmax = _mm512_reduce_max_ps(absmax_vec);
+  for (; element_index < num_elements; ++element_index) {
+    const float value = static_cast<float>(input_data[element_index]);
+    absmax = std::max(absmax, std::abs(value));
+  }
+
+  const float scale = std::max(absmax, eps) / quant_max;
+  quantize_fp8e4m3_cpu_kernel(input_data, output_data, num_elements, scale);
+  return scale;
+}
+
+std::tuple<at::Tensor, at::Tensor> scaled_fp8_quant_cpu(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& scale_opt,
+    int64_t num_token_padding,
+    bool use_per_token_if_dynamic) {
+  TORCH_CHECK(input.device().is_cpu(), "scaled_fp8_quant_cpu: input must be a CPU tensor");
+  TORCH_CHECK(input.is_contiguous(), "scaled_fp8_quant_cpu: input must be contiguous");
+  TORCH_CHECK(input.dim() == 2, "scaled_fp8_quant_cpu: input must be 2D");
+  TORCH_CHECK(num_token_padding >= 0, "scaled_fp8_quant_cpu: num_token_padding must be non-negative");
+
+  const auto input_dtype = input.scalar_type();
+  TORCH_CHECK(
+      input_dtype == at::kBFloat16 || input_dtype == at::kHalf || input_dtype == at::kFloat,
+      "scaled_fp8_quant_cpu: input must be bfloat16, float16, or float32");
+
+  const int64_t num_rows = input.size(0);
+  const int64_t row_size = input.size(1);
+  const int64_t output_rows = std::max(num_rows, num_token_padding);
+  auto output = at::empty({output_rows, row_size}, input.options().dtype(at::kFloat8_e4m3fn));
+
+  at::Tensor scale;
+  if (scale_opt.has_value()) {
+    scale = scale_opt.value();
+    TORCH_CHECK(scale.device().is_cpu(), "scaled_fp8_quant_cpu: scale must be a CPU tensor");
+    TORCH_CHECK(scale.numel() == 1, "scaled_fp8_quant_cpu: static scale must be scalar");
+    const float scale_value = scale.item<float>();
+    switch (input_dtype) {
+      case at::kFloat:
+        quantize_fp8e4m3_cpu_kernel(
+            input.data_ptr<float>(), output.data_ptr<at::Float8_e4m3fn>(), input.numel(), scale_value);
+        break;
+      case at::kHalf:
+        quantize_fp8e4m3_cpu_kernel(
+            input.data_ptr<at::Half>(), output.data_ptr<at::Float8_e4m3fn>(), input.numel(), scale_value);
+        break;
+      case at::kBFloat16:
+        quantize_fp8e4m3_cpu_kernel(
+            input.data_ptr<at::BFloat16>(), output.data_ptr<at::Float8_e4m3fn>(), input.numel(), scale_value);
+        break;
+      default:
+        TORCH_CHECK(false, "scaled_fp8_quant_cpu: unsupported input dtype");
+    }
+  } else if (use_per_token_if_dynamic) {
+    scale = at::empty({output_rows, 1}, input.options().dtype(at::kFloat));
+    switch (input_dtype) {
+      case at::kFloat:
+        per_token_group_quant_fp8_cpu_kernel(
+            input.data_ptr<float>(), output.data_ptr<at::Float8_e4m3fn>(), scale.data_ptr<float>(), num_rows, row_size, 1e-12f);
+        break;
+      case at::kHalf:
+        per_token_group_quant_fp8_cpu_kernel(
+            input.data_ptr<at::Half>(),
+            output.data_ptr<at::Float8_e4m3fn>(),
+            scale.data_ptr<float>(),
+            num_rows,
+            row_size,
+            1e-12f);
+        break;
+      case at::kBFloat16:
+        per_token_group_quant_fp8_cpu_kernel(
+            input.data_ptr<at::BFloat16>(),
+            output.data_ptr<at::Float8_e4m3fn>(),
+            scale.data_ptr<float>(),
+            num_rows,
+            row_size,
+            1e-12f);
+        break;
+      default:
+        TORCH_CHECK(false, "scaled_fp8_quant_cpu: unsupported input dtype");
+    }
+  } else {
+    scale = at::empty({1}, input.options().dtype(at::kFloat));
+    float scale_value = 0.0f;
+    switch (input_dtype) {
+      case at::kFloat:
+        scale_value = dynamic_per_tensor_scaled_fp8_quant_cpu_kernel(
+            input.data_ptr<float>(), output.data_ptr<at::Float8_e4m3fn>(), input.numel());
+        break;
+      case at::kHalf:
+        scale_value = dynamic_per_tensor_scaled_fp8_quant_cpu_kernel(
+            input.data_ptr<at::Half>(), output.data_ptr<at::Float8_e4m3fn>(), input.numel());
+        break;
+      case at::kBFloat16:
+        scale_value = dynamic_per_tensor_scaled_fp8_quant_cpu_kernel(
+            input.data_ptr<at::BFloat16>(), output.data_ptr<at::Float8_e4m3fn>(), input.numel());
+        break;
+      default:
+        TORCH_CHECK(false, "scaled_fp8_quant_cpu: unsupported input dtype");
+    }
+    scale.fill_(scale_value);
+  }
+
+  return std::make_tuple(output, scale);
+}
 // tinygemm interface
 template <typename scalar_t>
 void tinygemm_kernel(
