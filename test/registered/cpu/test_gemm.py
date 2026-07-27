@@ -16,6 +16,9 @@ from sglang.test.cpu_test_utils import (
     unpack_and_dequant_awq,
     unpack_and_dequant_gptq,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
@@ -324,6 +327,41 @@ class TestGemm(CustomTestCase):
 
         atol = rtol = precision[dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    def test_per_token_group_quant_fp8_cpu(self):
+        dtype = torch.bfloat16
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        eps = 1e-10
+
+        for shape, group_size in [
+            ((3, 128), 64),
+            ((2, 3, 256), 128),
+            ((2, 3, 130), 65),
+        ]:
+            x = torch.randn(shape, dtype=dtype).contiguous()
+            quantized, scale = per_token_group_quant_fp8(x, group_size, eps=eps)
+
+            expected_scale_shape = (*shape[:-1], shape[-1] // group_size)
+            self.assertEqual(quantized.shape, x.shape)
+            self.assertEqual(scale.shape, expected_scale_shape)
+            self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
+            self.assertEqual(scale.dtype, torch.float32)
+            self.assertEqual(quantized.device.type, "cpu")
+            self.assertEqual(scale.device.type, "cpu")
+
+            x_grouped = x.float().reshape(-1, group_size)
+            expected_scale = (
+                x_grouped.abs().amax(dim=-1).clamp_min(eps) / fp8_max
+            ).reshape(expected_scale_shape)
+            expected_quantized = (
+                (x_grouped / expected_scale.reshape(-1, 1))
+                .clamp(-fp8_max, fp8_max)
+                .reshape(shape)
+                .to(torch.float8_e4m3fn)
+            )
+
+            torch.testing.assert_close(scale, expected_scale)
+            torch.testing.assert_close(quantized.float(), expected_quantized.float())
 
     @parametrize(
         M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]

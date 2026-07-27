@@ -471,7 +471,8 @@ void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int6
 
 std::tuple<at::Tensor, at::Tensor>
 _quantize_fp8e4m3(const at::Tensor& t, bool channelwise, c10::optional<at::Tensor> scale_opt = c10::nullopt);
-
+std::tuple<at::Tensor, at::Tensor>
+per_token_group_quant_fp8_cpu(const at::Tensor& input, int64_t group_size, double eps);
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
@@ -599,6 +600,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("quantize_fp8e4m3", torch::kCPU, &_quantize_fp8e4m3);
   m.def("_quantize_fp8e4m3_vec(Tensor input, bool channelwise, Tensor? scale_opt) -> (Tensor,Tensor)");
   m.impl("_quantize_fp8e4m3_vec", torch::kCPU, &_quantize_fp8e4m3_vec);
+  m.def("per_token_group_quant_fp8_cpu(Tensor input, int group_size, float eps) -> (Tensor, Tensor)");
+  m.impl("per_token_group_quant_fp8_cpu", torch::kCPU, &per_token_group_quant_fp8_cpu);
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
   m.impl("silu_and_mul_cpu", torch::kCPU, &silu_and_mul_cpu);

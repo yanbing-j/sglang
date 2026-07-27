@@ -1,3 +1,7 @@
+#include <cstring>
+#include <cstdint>
+#include <cmath>
+#include <algorithm>
 #include "common.h"
 #include "gemm.h"
 #include "vec.h"
@@ -920,6 +924,248 @@ void fp_scaled_mm_kernel_impl(
 
 }  // anonymous namespace
 
+inline __m128i cvtfp32_fp8e4m3(__m512& src) {
+  // cvt 16x32 from fp32 to fp8 e4m3
+  const __m512i sign_mask = _mm512_set1_epi32(0x80000000);
+  const __m512i fp8_max = _mm512_set1_epi32(UINT32_C(1087) << 20);
+  const __m512i denorm_thresh = _mm512_set1_epi32(UINT32_C(121) << 23);
+  const __m512i denorm_mask = _mm512_set1_epi32(UINT32_C(141) << 23);
+  const __m512i bias_part1 = _mm512_set1_epi32((uint32_t)(7 - 127) << 23);
+  const __m512i rounding_bias = _mm512_set1_epi32(0x7FFFF);
+  __m512i f_bits = _mm512_castps_si512(src);
+  // Extract and save sign
+  __m512i sign = _mm512_and_epi32(f_bits, sign_mask);
+  f_bits = _mm512_xor_epi32(f_bits, sign);
+
+  // Prepare result containers
+  __m512i result = _mm512_setzero_si512();
+
+  // Step 1: Handle case of overflow
+  // (f_bits >= fp8_max): set result = 0x7f
+  __mmask16 overflow_mask = _mm512_cmpge_epu32_mask(f_bits, fp8_max);
+  if (overflow_mask) {
+    result = _mm512_mask_set1_epi32(result, overflow_mask, 0x7f);
+  }
+
+  // Step 2: Handle small numbers (denormals)
+  // Small numbers (f_bits < denorm_thresh)
+  __mmask16 denorm_thresh_mask = _mm512_cmplt_epu32_mask(f_bits, denorm_thresh);
+
+  if (denorm_thresh_mask) {
+    __m512 small_input = _mm512_castsi512_ps(f_bits);
+    __m512 small_denorm = _mm512_add_ps(small_input, _mm512_castsi512_ps(denorm_mask));
+    __m512i small_denorm_bits = _mm512_castps_si512(small_denorm);
+    __m512i small_result = _mm512_sub_epi32(small_denorm_bits, denorm_mask);
+    result = _mm512_mask_mov_epi32(result, denorm_thresh_mask, small_result);
+  }
+
+  // Step 3: Handle normal numbers
+  __mmask16 normal_mask = ~(overflow_mask | denorm_thresh_mask);
+
+  if (normal_mask) {
+    // mant_odd = (f_bits >> 20) & 1
+    __m512i mant_odd = _mm512_and_epi32(_mm512_srli_epi32(f_bits, 20), _mm512_set1_epi32(1));
+    // f_bits += bias_part1 + rounding_bias
+    __m512i rounded = _mm512_add_epi32(f_bits, bias_part1);
+    rounded = _mm512_add_epi32(rounded, rounding_bias);
+    // Add mant_odd
+    rounded = _mm512_add_epi32(rounded, mant_odd);
+    // Shift right by 20 bits
+    __m512i normal_result = _mm512_srli_epi32(rounded, 20);
+    result = _mm512_mask_mov_epi32(result, normal_mask, normal_result);
+  }
+
+  // Merge back the sign
+  __m512i sign_shifted = _mm512_srli_epi32(sign, 24);
+  result = _mm512_or_epi32(result, sign_shifted);
+
+  // Now result is 16 x 32-bit integers, but we only need 8-bit for each
+  __m512i packed = _mm512_and_si512(result, _mm512_set1_epi32(0xFF));
+
+  // Narrow 32-bit integers to 8-bit
+  return _mm512_cvtepi32_epi8(packed);
+}
+
+inline __m512 load_16_as_fp32(const float* __restrict__ input) {
+  return _mm512_loadu_ps(input);
+}
+
+inline __m512 load_16_as_fp32(const at::Half* __restrict__ input) {
+  return CVT_FP16_TO_FP32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(input)));
+}
+
+inline __m512 load_16_as_fp32(const at::BFloat16* __restrict__ input) {
+  __m256i input_bf16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input));
+  return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(input_bf16), 16));
+}
+
+template <typename scalar_t>
+void per_token_group_quant_fp8_cpu_kernel(
+    const scalar_t* __restrict__ input_data,
+    at::Float8_e4m3fn* __restrict__ quantized_data,
+    float* __restrict__ scale_data,
+    int64_t num_groups,
+    int64_t group_size,
+    float eps) {
+  constexpr float quant_max = 448.0f;
+  constexpr float neg_quant_max = -quant_max;
+  const __m512 sign_bit = _mm512_set1_ps(-0.0f);
+  const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+  const __m512 neg_quant_max_vec = _mm512_set1_ps(neg_quant_max);
+
+  // Common case: group_size is a multiple of 16 (e.g. 64, 128, 256).
+  // Unroll 2x (32 elements per iteration) to improve ILP and reduce loop overhead.
+  const bool aligned = (group_size % 32 == 0);
+
+  at::parallel_for(0, num_groups, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t group_index = begin; group_index < end; ++group_index) {
+      const int64_t group_offset = group_index * group_size;
+      __m512 absmax_vec0 = _mm512_setzero_ps();
+      __m512 absmax_vec1 = _mm512_setzero_ps();
+
+      int64_t element_index = 0;
+
+      // Pass 1: find absmax — unrolled 2x
+      if (aligned) {
+        for (; element_index < group_size; element_index += 32) {
+          __m512 v0 = load_16_as_fp32(input_data + group_offset + element_index);
+          __m512 v1 = load_16_as_fp32(input_data + group_offset + element_index + 16);
+          absmax_vec0 = _mm512_max_ps(absmax_vec0, _mm512_andnot_ps(sign_bit, v0));
+          absmax_vec1 = _mm512_max_ps(absmax_vec1, _mm512_andnot_ps(sign_bit, v1));
+        }
+      } else {
+        for (; element_index <= group_size - 32; element_index += 32) {
+          __m512 v0 = load_16_as_fp32(input_data + group_offset + element_index);
+          __m512 v1 = load_16_as_fp32(input_data + group_offset + element_index + 16);
+          absmax_vec0 = _mm512_max_ps(absmax_vec0, _mm512_andnot_ps(sign_bit, v0));
+          absmax_vec1 = _mm512_max_ps(absmax_vec1, _mm512_andnot_ps(sign_bit, v1));
+        }
+        for (; element_index <= group_size - 16; element_index += 16) {
+          __m512 v0 = load_16_as_fp32(input_data + group_offset + element_index);
+          absmax_vec0 = _mm512_max_ps(absmax_vec0, _mm512_andnot_ps(sign_bit, v0));
+        }
+      }
+      absmax_vec0 = _mm512_max_ps(absmax_vec0, absmax_vec1);
+      float absmax = _mm512_reduce_max_ps(absmax_vec0);
+      for (; element_index < group_size; ++element_index) {
+        absmax = std::max(absmax, std::abs(static_cast<float>(input_data[group_offset + element_index])));
+      }
+
+      const float scale = std::max(absmax, eps) / quant_max;
+      const float inv_scale = 1.0f / scale;
+      scale_data[group_index] = scale;
+
+      const __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+      element_index = 0;
+
+      // Pass 2: scale + clamp + convert to fp8 — unrolled 2x
+      if (aligned) {
+        for (; element_index < group_size; element_index += 32) {
+          __m512 v0 = load_16_as_fp32(input_data + group_offset + element_index);
+          __m512 v1 = load_16_as_fp32(input_data + group_offset + element_index + 16);
+          v0 = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v0, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
+          v1 = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v1, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
+          __m128i fp8_0 = cvtfp32_fp8e4m3(v0);
+          __m128i fp8_1 = cvtfp32_fp8e4m3(v1);
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(quantized_data + group_offset + element_index), fp8_0);
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(quantized_data + group_offset + element_index + 16), fp8_1);
+        }
+      } else {
+        for (; element_index <= group_size - 32; element_index += 32) {
+          __m512 v0 = load_16_as_fp32(input_data + group_offset + element_index);
+          __m512 v1 = load_16_as_fp32(input_data + group_offset + element_index + 16);
+          v0 = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v0, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
+          v1 = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v1, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
+          __m128i fp8_0 = cvtfp32_fp8e4m3(v0);
+          __m128i fp8_1 = cvtfp32_fp8e4m3(v1);
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(quantized_data + group_offset + element_index), fp8_0);
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(quantized_data + group_offset + element_index + 16), fp8_1);
+        }
+        for (; element_index <= group_size - 16; element_index += 16) {
+          __m512 v0 = load_16_as_fp32(input_data + group_offset + element_index);
+          v0 = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v0, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
+          __m128i fp8_0 = cvtfp32_fp8e4m3(v0);
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(quantized_data + group_offset + element_index), fp8_0);
+        }
+        if (element_index < group_size) {
+          alignas(64) float tail_values[16] = {0.0f};
+          const int64_t tail_size = group_size - element_index;
+          for (int64_t tail_index = 0; tail_index < tail_size; ++tail_index) {
+            const float value = static_cast<float>(input_data[group_offset + element_index + tail_index]) * inv_scale;
+            tail_values[tail_index] = std::clamp(value, neg_quant_max, quant_max);
+          }
+          __m512 tail_vec = _mm512_load_ps(tail_values);
+          __m128i tail_fp8_vec = cvtfp32_fp8e4m3(tail_vec);
+          alignas(16) uint8_t tail_fp8[16];
+          _mm_store_si128(reinterpret_cast<__m128i*>(tail_fp8), tail_fp8_vec);
+          uint8_t* quantized_tail = reinterpret_cast<uint8_t*>(quantized_data + group_offset + element_index);
+          for (int64_t tail_index = 0; tail_index < tail_size; ++tail_index) {
+            quantized_tail[tail_index] = tail_fp8[tail_index];
+          }
+        }
+      }
+    }
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor>
+per_token_group_quant_fp8_cpu(const at::Tensor& input, int64_t group_size, double eps) {
+  TORCH_CHECK(input.device().is_cpu(), "per_token_group_quant_fp8_cpu: input must be a CPU tensor");
+  TORCH_CHECK(input.is_contiguous(), "per_token_group_quant_fp8_cpu: input must be contiguous");
+  TORCH_CHECK(input.dim() >= 2, "per_token_group_quant_fp8_cpu: input must have at least 2 dimensions");
+  TORCH_CHECK(group_size > 0, "per_token_group_quant_fp8_cpu: group_size must be positive");
+  TORCH_CHECK(
+      input.size(-1) % group_size == 0,
+      "per_token_group_quant_fp8_cpu: input last dimension must be divisible by group_size");
+  TORCH_CHECK(eps > 0.0, "per_token_group_quant_fp8_cpu: eps must be positive");
+
+  const auto input_dtype = input.scalar_type();
+  TORCH_CHECK(
+      input_dtype == at::kBFloat16 || input_dtype == at::kHalf || input_dtype == at::kFloat,
+      "per_token_group_quant_fp8_cpu: input must be bfloat16, float16, or float32");
+
+  auto scale_sizes = input.sizes().vec();
+  scale_sizes.back() = input.size(-1) / group_size;
+  auto scale = at::empty(scale_sizes, input.options().dtype(at::kFloat));
+  auto quantized = at::empty(input.sizes(), input.options().dtype(at::kFloat8_e4m3fn));
+
+  const int64_t num_groups = input.numel() / group_size;
+  if (num_groups > 0) {
+    switch (input_dtype) {
+      case at::kFloat:
+        per_token_group_quant_fp8_cpu_kernel<float>(
+            input.data_ptr<float>(),
+            quantized.data_ptr<at::Float8_e4m3fn>(),
+            scale.data_ptr<float>(),
+            num_groups,
+            group_size,
+            static_cast<float>(eps));
+        break;
+      case at::kHalf:
+        per_token_group_quant_fp8_cpu_kernel<at::Half>(
+            input.data_ptr<at::Half>(),
+            quantized.data_ptr<at::Float8_e4m3fn>(),
+            scale.data_ptr<float>(),
+            num_groups,
+            group_size,
+            static_cast<float>(eps));
+        break;
+      case at::kBFloat16:
+        per_token_group_quant_fp8_cpu_kernel<at::BFloat16>(
+            input.data_ptr<at::BFloat16>(),
+            quantized.data_ptr<at::Float8_e4m3fn>(),
+            scale.data_ptr<float>(),
+            num_groups,
+            group_size,
+            static_cast<float>(eps));
+        break;
+      default:
+        TORCH_CHECK(false, "per_token_group_quant_fp8_cpu: unsupported input dtype");
+    }
+  }
+
+  return std::make_tuple(quantized, scale);
+}
 // tinygemm interface
 template <typename scalar_t>
 void tinygemm_kernel(

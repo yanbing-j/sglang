@@ -814,8 +814,42 @@ def sglang_per_token_quant_fp8(
     return x_q, x_s
 
 
+def sglang_per_token_group_quant_fp8_cpu(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
+):
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` must be divisible by `group_size`"
+    assert x.is_contiguous(), "`x` is not contiguous"
+
+    if column_major_scales or scale_tma_aligned or scale_ue8m0:
+        raise NotImplementedError(
+            "CPU per_token_group_quant_fp8 only supports row-major fp32 scales."
+        )
+    if fuse_silu_and_mul:
+        raise NotImplementedError(
+            "CPU per_token_group_quant_fp8 does not support fuse_silu_and_mul."
+        )
+    if masked_m is not None:
+        raise NotImplementedError(
+            "CPU per_token_group_quant_fp8 does not support masked_m."
+        )
+
+    return torch.ops.sgl_kernel.per_token_group_quant_fp8_cpu(x, group_size, eps)
+
+
 if _is_cuda:
     per_token_group_quant_fp8 = sglang_per_token_group_quant_fp8
+elif _is_cpu:
+    per_token_group_quant_fp8 = sglang_per_token_group_quant_fp8_cpu
 else:
     per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
 
