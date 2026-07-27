@@ -689,6 +689,14 @@ def register_fake_ops(tp_size: int):
         scale = input.new_empty(scale_shape, dtype=torch.float)
         return act_quant, scale
 
+    @torch.library.register_fake("sgl_kernel::mxfp8_group_quantize_cpu")
+    def _(input):
+        act_quant = input.new_empty(input.shape, dtype=torch.float8_e4m3fn)
+        scale = input.new_empty(
+            (input.shape[0], input.shape[1] // 32), dtype=torch.uint8
+        )
+        return act_quant, scale
+
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.

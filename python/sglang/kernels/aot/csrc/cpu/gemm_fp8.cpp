@@ -1181,12 +1181,18 @@ void quantize_fp8e4m3_cpu_kernel(
 
   at::parallel_for(0, num_elements, 1024, [&](int64_t begin, int64_t end) {
     int64_t element_index = begin;
+    for (; element_index <= end - 32; element_index += 32) {
+      __m512 v0 = load_16_as_fp32(input_data + element_index);
+      __m512 v1 = load_16_as_fp32(input_data + element_index + 16);
+      v0 = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v0, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
+      v1 = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(v1, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(output_data + element_index), cvtfp32_fp8e4m3(v0));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(output_data + element_index + 16), cvtfp32_fp8e4m3(v1));
+    }
     for (; element_index <= end - 16; element_index += 16) {
       __m512 value_vec = load_16_as_fp32(input_data + element_index);
-      __m512 scaled_vec = _mm512_mul_ps(value_vec, inv_scale_vec);
-      __m512 clamped_vec = _mm512_min_ps(_mm512_max_ps(scaled_vec, neg_quant_max_vec), quant_max_vec);
-      __m128i fp8_vec = cvtfp32_fp8e4m3(clamped_vec);
-      _mm_storeu_si128(reinterpret_cast<__m128i*>(output_data + element_index), fp8_vec);
+      __m512 clamped_vec = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(value_vec, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(output_data + element_index), cvtfp32_fp8e4m3(clamped_vec));
     }
 
     if (element_index < end) {
@@ -1214,20 +1220,30 @@ float dynamic_per_tensor_scaled_fp8_quant_cpu_kernel(
   constexpr float quant_max = 448.0f;
   constexpr float eps = 1.0e-12f;
   const __m512 sign_bit = _mm512_set1_ps(-0.0f);
-  float absmax = 0.0f;
-  __m512 absmax_vec = _mm512_setzero_ps();
 
-  int64_t element_index = 0;
-  for (; element_index <= num_elements - 16; element_index += 16) {
-    __m512 value_vec = load_16_as_fp32(input_data + element_index);
-    __m512 abs_vec = _mm512_andnot_ps(sign_bit, value_vec);
-    absmax_vec = _mm512_max_ps(absmax_vec, abs_vec);
-  }
-  absmax = _mm512_reduce_max_ps(absmax_vec);
-  for (; element_index < num_elements; ++element_index) {
-    const float value = static_cast<float>(input_data[element_index]);
-    absmax = std::max(absmax, std::abs(value));
-  }
+  // Parallel absmax reduction: each thread computes a local max, then merge.
+  int num_threads = at::get_num_threads();
+  std::vector<float> per_thread_absmax(num_threads, 0.0f);
+  at::parallel_for(0, num_elements, 4096, [&](int64_t begin, int64_t end) {
+    int tid = at::get_thread_num();
+    __m512 absmax_vec0 = _mm512_setzero_ps();
+    __m512 absmax_vec1 = _mm512_setzero_ps();
+    int64_t i = begin;
+    for (; i <= end - 32; i += 32) {
+      absmax_vec0 = _mm512_max_ps(absmax_vec0, _mm512_andnot_ps(sign_bit, load_16_as_fp32(input_data + i)));
+      absmax_vec1 = _mm512_max_ps(absmax_vec1, _mm512_andnot_ps(sign_bit, load_16_as_fp32(input_data + i + 16)));
+    }
+    absmax_vec0 = _mm512_max_ps(absmax_vec0, absmax_vec1);
+    for (; i <= end - 16; i += 16) {
+      absmax_vec0 = _mm512_max_ps(absmax_vec0, _mm512_andnot_ps(sign_bit, load_16_as_fp32(input_data + i)));
+    }
+    float local_absmax = _mm512_reduce_max_ps(absmax_vec0);
+    for (; i < end; ++i) {
+      local_absmax = std::max(local_absmax, std::abs(static_cast<float>(input_data[i])));
+    }
+    per_thread_absmax[tid] = local_absmax;
+  });
+  float absmax = *std::max_element(per_thread_absmax.begin(), per_thread_absmax.end());
 
   const float scale = std::max(absmax, eps) / quant_max;
   quantize_fp8e4m3_cpu_kernel(input_data, output_data, num_elements, scale);
@@ -1324,6 +1340,101 @@ std::tuple<at::Tensor, at::Tensor> scaled_fp8_quant_cpu(
         TORCH_CHECK(false, "scaled_fp8_quant_cpu: unsupported input dtype");
     }
     scale.fill_(scale_value);
+  }
+
+  return std::make_tuple(output, scale);
+}
+
+inline uint8_t ceil_to_ue8m0_byte(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  uint32_t exponent = (bits >> 23) & 0xFF;
+  const uint32_t mantissa = bits & 0x7FFFFF;
+  exponent += mantissa != 0;
+  exponent = std::min<uint32_t>(std::max<uint32_t>(exponent, 1), 254);
+  return static_cast<uint8_t>(exponent);
+}
+
+inline float ue8m0_byte_to_float(uint8_t scale) {
+  const uint32_t bits = static_cast<uint32_t>(scale) << 23;
+  float value;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+template <typename scalar_t>
+void mxfp8_group_quantize_cpu_kernel(
+    const scalar_t* __restrict__ input_data,
+    at::Float8_e4m3fn* __restrict__ output_data,
+    uint8_t* __restrict__ scale_data,
+    int64_t num_groups) {
+  constexpr int64_t group_size = 32;
+  constexpr float quant_max = 448.0f;
+  constexpr float neg_quant_max = -quant_max;
+  const __m512 sign_bit = _mm512_set1_ps(-0.0f);
+  const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+  const __m512 neg_quant_max_vec = _mm512_set1_ps(neg_quant_max);
+
+  at::parallel_for(0, num_groups, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t group_index = begin; group_index < end; ++group_index) {
+      const int64_t group_offset = group_index * group_size;
+      __m512 value_vec0 = load_16_as_fp32(input_data + group_offset);
+      __m512 value_vec1 = load_16_as_fp32(input_data + group_offset + 16);
+      __m512 abs_vec0 = _mm512_andnot_ps(sign_bit, value_vec0);
+      __m512 abs_vec1 = _mm512_andnot_ps(sign_bit, value_vec1);
+      const float absmax = _mm512_reduce_max_ps(_mm512_max_ps(abs_vec0, abs_vec1));
+      const uint8_t scale_byte = ceil_to_ue8m0_byte(absmax / quant_max);
+      const float inv_scale = 1.0f / ue8m0_byte_to_float(scale_byte);
+      scale_data[group_index] = scale_byte;
+
+      const __m512 inv_scale_vec = _mm512_set1_ps(inv_scale);
+      __m512 scaled_vec0 = _mm512_mul_ps(value_vec0, inv_scale_vec);
+      __m512 scaled_vec1 = _mm512_mul_ps(value_vec1, inv_scale_vec);
+      __m512 clamped_vec0 = _mm512_min_ps(_mm512_max_ps(scaled_vec0, neg_quant_max_vec), quant_max_vec);
+      __m512 clamped_vec1 = _mm512_min_ps(_mm512_max_ps(scaled_vec1, neg_quant_max_vec), quant_max_vec);
+      __m128i fp8_vec0 = cvtfp32_fp8e4m3(clamped_vec0);
+      __m128i fp8_vec1 = cvtfp32_fp8e4m3(clamped_vec1);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(output_data + group_offset), fp8_vec0);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(output_data + group_offset + 16), fp8_vec1);
+    }
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor> mxfp8_group_quantize_cpu(const at::Tensor& input) {
+  TORCH_CHECK(input.device().is_cpu(), "mxfp8_group_quantize_cpu: input must be a CPU tensor");
+  TORCH_CHECK(input.is_contiguous(), "mxfp8_group_quantize_cpu: input must be contiguous");
+  TORCH_CHECK(input.dim() == 2, "mxfp8_group_quantize_cpu: input must be 2D");
+  TORCH_CHECK(input.size(1) % 32 == 0, "mxfp8_group_quantize_cpu: input K dimension must be divisible by 32");
+
+  const auto input_dtype = input.scalar_type();
+  TORCH_CHECK(
+      input_dtype == at::kBFloat16 || input_dtype == at::kHalf || input_dtype == at::kFloat,
+      "mxfp8_group_quantize_cpu: input must be bfloat16, float16, or float32");
+
+  auto output = at::empty(input.sizes(), input.options().dtype(at::kFloat8_e4m3fn));
+  auto scale = at::empty({input.size(0), input.size(1) / 32}, input.options().dtype(at::kByte));
+  const int64_t num_groups = input.numel() / 32;
+
+  if (num_groups > 0) {
+    switch (input_dtype) {
+      case at::kFloat:
+        mxfp8_group_quantize_cpu_kernel(
+            input.data_ptr<float>(), output.data_ptr<at::Float8_e4m3fn>(), scale.data_ptr<uint8_t>(), num_groups);
+        break;
+      case at::kHalf:
+        mxfp8_group_quantize_cpu_kernel(
+            input.data_ptr<at::Half>(), output.data_ptr<at::Float8_e4m3fn>(), scale.data_ptr<uint8_t>(), num_groups);
+        break;
+      case at::kBFloat16:
+        mxfp8_group_quantize_cpu_kernel(
+            input.data_ptr<at::BFloat16>(),
+            output.data_ptr<at::Float8_e4m3fn>(),
+            scale.data_ptr<uint8_t>(),
+            num_groups);
+        break;
+      default:
+        TORCH_CHECK(false, "mxfp8_group_quantize_cpu: unsupported input dtype");
+    }
   }
 
   return std::make_tuple(output, scale);

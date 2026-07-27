@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     get_device_sm,
     get_hip_version,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -1237,6 +1238,8 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.is_contiguous(), "MXFP8 quantization requires a contiguous 2D tensor."
     _, k = x.shape
     assert k % 32 == 0, f"{k=} must be divisible by 32"
+    if is_cpu():
+        return torch.ops.sgl_kernel.mxfp8_group_quantize_cpu(x)
     downcast_to_mxfp = _get_triton_mxfp8_downcast()
     q_input, scale_u8 = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=1)
     return q_input.contiguous(), scale_u8.contiguous()
