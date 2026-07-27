@@ -19,6 +19,7 @@ from sglang.test.cpu_test_utils import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
+    static_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
 from sglang.test.test_utils import CustomTestCase
@@ -444,6 +445,31 @@ class TestGemm(CustomTestCase):
             self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
             self.assertEqual(scale_u8.dtype, torch.uint8)
             torch.testing.assert_close(scale_u8, expected_scale_u8)
+            torch.testing.assert_close(
+                quantized.float(), expected_quantized.float(), rtol=0.20, atol=2.0
+            )
+
+    def test_static_quant_fp8_cpu(self):
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+        for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            x = (torch.randn(5, 19, dtype=dtype) * 13).contiguous()
+            scale = x.float().abs().amax().clamp_min(1e-12).reshape(1) / fp8_max
+            expected_quantized = (
+                (x.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+            )
+
+            quantized, returned_scale = static_quant_fp8(x, scale, repeat_scale=False)
+            self.assertEqual(quantized.shape, x.shape)
+            self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
+            self.assertIs(returned_scale, scale)
+            torch.testing.assert_close(
+                quantized.float(), expected_quantized.float(), rtol=0.20, atol=2.0
+            )
+
+            quantized, repeated_scale = static_quant_fp8(x, scale, repeat_scale=True)
+            self.assertEqual(repeated_scale.shape, (x.shape[0], 1))
+            torch.testing.assert_close(repeated_scale, scale.expand(x.shape[0], 1))
             torch.testing.assert_close(
                 quantized.float(), expected_quantized.float(), rtol=0.20, atol=2.0
             )

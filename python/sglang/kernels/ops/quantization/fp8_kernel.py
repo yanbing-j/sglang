@@ -928,6 +928,18 @@ def static_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
     assert x_s.numel() == 1, "only supports per-tensor scale"
 
+    if _is_cpu:
+        x_q, x_s_out = torch.ops.sgl_kernel.scaled_fp8_quant_cpu(
+            x,
+            x_s,
+            0,
+            False,
+        )
+        if repeat_scale:
+            M = x.numel() // x.shape[-1]
+            x_s_out = x_s_out.reshape(1, 1).expand(M, 1).contiguous()
+        return x_q, x_s_out
+
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]
