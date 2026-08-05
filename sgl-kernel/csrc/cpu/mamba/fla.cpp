@@ -319,53 +319,86 @@ struct solve_tril_kernel<at::BFloat16, CHUNK_SIZE> {
 
     constexpr int COLS = CHUNK_SIZE / 16;
 
-    __m512 va;
-    __m512 vb[COLS];
-    __m512 vsum[COLS];
+    // Use a float32 scratch buffer so the Neumann expansion stays in float32
+    // throughout.  The previous approach stored each row result as bf16 and
+    // read it back as bf16 on the next iteration, introducing ~0.78% rounding
+    // error per row that accumulated over CHUNK_SIZE iterations (~2% total).
+    // Now we convert bf16 → float32 once at the start, expand entirely in
+    // float32, then convert back to bf16 once at the end.
+    alignas(64) float scratch[CHUNK_SIZE * CHUNK_SIZE];
 
-    // for len == 0 and row < size, we don't have to write back zero again
-    // as in `apply_mask_kernel`, we already set zero for the upper-triangular region
-    for (int i = 1; i < size; ++i) {
-      // load row attn[..., i, :i]
-      at::BFloat16* __restrict__ row_ptr = attn2 + i * CHUNK_SIZE;
+    // Step 1: copy lower-triangular bf16 attn2 → float32 scratch
+    for (int i = 0; i < size; ++i) {
       Unroll<COLS>{}([&](auto col) {
         int len = std::min(i - col * 16, 16);
         if (len > 0) {
           const __mmask16 vmask = (1 << len) - 1;
-          vsum[col] = CVT_BF16_TO_FP32(_mm256_maskz_loadu_epi16(vmask, row_ptr + col * 16));
+          __m512 vf = CVT_BF16_TO_FP32(
+              _mm256_maskz_loadu_epi16(vmask, reinterpret_cast<const __m256i*>(attn2 + i * CHUNK_SIZE + col * 16)));
+          _mm512_mask_storeu_ps(scratch + i * CHUNK_SIZE + col * 16, vmask, vf);
+        }
+      });
+    }
+
+    // Step 2: Neumann expansion entirely in float32
+    // vsum = row + (row.unsqueeze(-1) * scratch[:i, :i]).sum(-2)
+    __m512 va;
+    __m512 vb[COLS];
+    __m512 vsum[COLS];
+
+    for (int i = 1; i < size; ++i) {
+      float* __restrict__ row_ptr = scratch + i * CHUNK_SIZE;
+
+      // load row scratch[i, :i] into vsum
+      Unroll<COLS>{}([&](auto col) {
+        int len = std::min(i - col * 16, 16);
+        if (len > 0) {
+          const __mmask16 vmask = (1 << len) - 1;
+          vsum[col] = _mm512_maskz_loadu_ps(vmask, row_ptr + col * 16);
         }
       });
 
-      // row = attn[..., i, :i].clone()
-      // sub = attn[..., :i, :i].clone()
-      // vsum = row + (row.unsqueeze(-1) * sub).sum(-2)
       for (int k = 0; k < i; ++k) {
-        va = _mm512_set1_ps(static_cast<float>(row_ptr[k]));
+        va = _mm512_set1_ps(row_ptr[k]);  // float32, no bf16 round-trip
 
-        const at::BFloat16* __restrict__ row_k_ptr = attn2 + k * CHUNK_SIZE;
+        float* __restrict__ row_k = scratch + k * CHUNK_SIZE;
         Unroll<COLS>{}([&](auto col) {
           int len = std::min(k - col * 16, 16);
           if (len > 0) {
             const __mmask16 vmask = (1 << len) - 1;
-            vb[col] = CVT_BF16_TO_FP32(_mm256_maskz_loadu_epi16(vmask, row_k_ptr + col * 16));
+            vb[col] = _mm512_maskz_loadu_ps(vmask, row_k + col * 16);
             vsum[col] = _mm512_fmadd_ps(va, vb[col], vsum[col]);
           }
         });
       }
 
-      // attn[..., i, :i] = vsum
+      // store back to float32 scratch (no bf16 rounding here)
       Unroll<COLS>{}([&](auto col) {
         int len = std::min(i - col * 16, 16);
         if (len > 0) {
           const __mmask16 vmask = (1 << len) - 1;
-          _mm256_mask_storeu_epi16(row_ptr + col * 16, vmask, (__m256i)(_mm512_cvtneps_pbh(vsum[col])));
+          _mm512_mask_storeu_ps(row_ptr + col * 16, vmask, vsum[col]);
         }
       });
     }
 
-    // attn = attn + torch.eye(chunk_size)
+    // Step 3: set diagonal = 1 (identity contribution; scratch diagonal was
+    // never written so set directly rather than +=)
     for (int i = 0; i < size; ++i) {
-      attn2[i * CHUNK_SIZE + i] += 1.f;
+      scratch[i * CHUNK_SIZE + i] = 1.f;
+    }
+
+    // Step 4: convert float32 scratch (lower tri + diagonal) → bf16 attn2
+    for (int i = 0; i < size; ++i) {
+      Unroll<COLS>{}([&](auto col) {
+        int len = std::min(i + 1 - col * 16, 16);  // +1 to include diagonal
+        if (len > 0) {
+          const __mmask16 vmask = (1 << len) - 1;
+          __m512 vf = _mm512_maskz_loadu_ps(vmask, scratch + i * CHUNK_SIZE + col * 16);
+          _mm256_mask_storeu_epi16(
+              reinterpret_cast<__m256i*>(attn2 + i * CHUNK_SIZE + col * 16), vmask, (__m256i)(_mm512_cvtneps_pbh(vf)));
+        }
+      });
     }
   }
 };
