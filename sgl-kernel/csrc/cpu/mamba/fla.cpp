@@ -250,6 +250,20 @@ struct apply_mask_kernel {
   }
 };
 
+// Variant that outputs float32 directly (avoids bf16 round-trip for solve_tril).
+template <typename scalar_t, int CHUNK_SIZE>
+struct apply_mask_f32_kernel {
+  static inline void apply(
+      float* __restrict__ out_f32,
+      const float* __restrict__ attn,
+      const scalar_t* __restrict__ beta,
+      const float* __restrict__ d,
+      int size,
+      int b_stride = 0) {
+    TORCH_CHECK(false, "apply_mask_f32_kernel: scalar path not implemented!");
+  }
+};
+
 #if defined(CPU_CAPABILITY_AVX512)
 template <int CHUNK_SIZE, bool has_beta>
 struct apply_mask_kernel<at::BFloat16, CHUNK_SIZE, has_beta> {
@@ -304,9 +318,49 @@ struct apply_mask_kernel<at::BFloat16, CHUNK_SIZE, has_beta> {
 };
 #endif
 
+#if defined(CPU_CAPABILITY_AVX512)
+template <int CHUNK_SIZE>
+struct apply_mask_f32_kernel<at::BFloat16, CHUNK_SIZE> {
+  // Same logic as apply_mask_kernel<has_beta=true> but writes float32 to out_f32.
+  // This lets solve_tril_kernel operate entirely on a single float32 buffer (no
+  // separate step-1 bf16→f32 conversion), preserving cache-friendly single-stream
+  // access while saving the explicit conversion pass (~12 KB/call).
+  static inline void apply(
+      float* __restrict__ out_f32,
+      const float* __restrict__ attn,
+      const at::BFloat16* __restrict__ beta,
+      const float* __restrict__ d,
+      int size,
+      int b_stride = 0) {
+    static_assert(CHUNK_SIZE % 16 == 0);
+    constexpr int ROWS = CHUNK_SIZE;
+    constexpr int COLS = CHUNK_SIZE / 16;
+    __m512 vbeta;
+    auto compute = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+      constexpr int len = std::max(0, std::min(row - col * 16, 16));  // strict lower
+      if (row < size) {
+        if constexpr (col == 0) {
+          vbeta = _mm512_set1_ps(-static_cast<float>(beta[row * b_stride]));
+        }
+        if constexpr (len > 0) {
+          constexpr __mmask16 vmask = (1 << len) - 1;
+          __m512 va = _mm512_maskz_loadu_ps(vmask, attn + row * CHUNK_SIZE + col * 16);
+          __m512 vd = _mm512_maskz_loadu_ps(vmask, d + row * CHUNK_SIZE + col * 16);
+          __m512 vc = _mm512_mul_ps(_mm512_mul_ps(va, vbeta), vd);
+          _mm512_mask_storeu_ps(out_f32 + row * CHUNK_SIZE + col * 16, vmask, vc);
+        }
+      }
+    };
+    Unroll<ROWS * COLS>{}(compute);
+  }
+};
+#endif
+
 template <typename scalar_t, int CHUNK_SIZE>
 struct solve_tril_kernel {
-  static inline void apply(scalar_t* __restrict__ attn2, int size) {
+  static inline void apply(scalar_t* __restrict__ attn2, float* __restrict__ scratch, int size) {
     TORCH_CHECK(false, "solve_tril_kernel: scalar path not implemented!");
   }
 };
@@ -314,18 +368,16 @@ struct solve_tril_kernel {
 #if defined(CPU_CAPABILITY_AVX512)
 template <int CHUNK_SIZE>
 struct solve_tril_kernel<at::BFloat16, CHUNK_SIZE> {
-  static inline void apply(at::BFloat16* __restrict__ attn2, int size) {
+  static inline void apply(at::BFloat16* __restrict__ attn2, float* __restrict__ scratch, int size) {
     static_assert(CHUNK_SIZE % 16 == 0);
 
     constexpr int COLS = CHUNK_SIZE / 16;
 
-    // Use a float32 scratch buffer so the Neumann expansion stays in float32
-    // throughout.  The previous approach stored each row result as bf16 and
-    // read it back as bf16 on the next iteration, introducing ~0.78% rounding
-    // error per row that accumulated over CHUNK_SIZE iterations (~2% total).
-    // Now we convert bf16 → float32 once at the start, expand entirely in
-    // float32, then convert back to bf16 once at the end.
-    alignas(64) float scratch[CHUNK_SIZE * CHUNK_SIZE];
+    // Precision fix: keep the Neumann expansion in float32 throughout.
+    // scratch is tmp3 (reused from the caller, no extra allocation).
+    // Step 1 converts bf16 attn2 → f32 scratch once; expansion reads/writes
+    // all-f32 scratch (single buffer, good prefetcher behavior); step 4
+    // converts back once.
 
     // Step 1: copy lower-triangular bf16 attn2 → float32 scratch
     for (int i = 0; i < size; ++i) {
@@ -340,8 +392,7 @@ struct solve_tril_kernel<at::BFloat16, CHUNK_SIZE> {
       });
     }
 
-    // Step 2: Neumann expansion entirely in float32
-    // vsum = row + (row.unsqueeze(-1) * scratch[:i, :i]).sum(-2)
+    // Step 2: Neumann expansion entirely in float32 (single buffer = scratch)
     __m512 va;
     __m512 vb[COLS];
     __m512 vsum[COLS];
@@ -349,7 +400,6 @@ struct solve_tril_kernel<at::BFloat16, CHUNK_SIZE> {
     for (int i = 1; i < size; ++i) {
       float* __restrict__ row_ptr = scratch + i * CHUNK_SIZE;
 
-      // load row scratch[i, :i] into vsum
       Unroll<COLS>{}([&](auto col) {
         int len = std::min(i - col * 16, 16);
         if (len > 0) {
@@ -359,7 +409,7 @@ struct solve_tril_kernel<at::BFloat16, CHUNK_SIZE> {
       });
 
       for (int k = 0; k < i; ++k) {
-        va = _mm512_set1_ps(row_ptr[k]);  // float32, no bf16 round-trip
+        va = _mm512_set1_ps(row_ptr[k]);  // f32 scalar from scratch
 
         float* __restrict__ row_k = scratch + k * CHUNK_SIZE;
         Unroll<COLS>{}([&](auto col) {
@@ -372,7 +422,6 @@ struct solve_tril_kernel<at::BFloat16, CHUNK_SIZE> {
         });
       }
 
-      // store back to float32 scratch (no bf16 rounding here)
       Unroll<COLS>{}([&](auto col) {
         int len = std::min(i - col * 16, 16);
         if (len > 0) {
@@ -382,8 +431,7 @@ struct solve_tril_kernel<at::BFloat16, CHUNK_SIZE> {
       });
     }
 
-    // Step 3: set diagonal = 1 (identity contribution; scratch diagonal was
-    // never written so set directly rather than +=)
+    // Step 3: set diagonal = 1
     for (int i = 0; i < size; ++i) {
       scratch[i * CHUNK_SIZE + i] = 1.f;
     }
@@ -814,15 +862,14 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
           /*     C */ attn);
 
       for (int64_t hv = h * HG; hv < h * HG + HG; ++hv) {
-        // step 3: attn2 = -attn * beta * d
+        // step 3: attn2 = -attn * beta * d  (bf16)
         const scalar_t* __restrict__ beta_ptr = beta + (batch_offset + mb_start) * Hv + hv;
         const float* __restrict__ d_ptr = d + nt * (Hv * CHUNK_SIZE * CHUNK_SIZE) + hv * (CHUNK_SIZE * CHUNK_SIZE);
         apply_mask_kernel<scalar_t, CHUNK_SIZE, true>::apply(attn2, attn, beta_ptr, d_ptr, mb_size, Hv);
 
-        // step 4: solve_tril(attn2) -> (I + L)^{-1}, L = strict-lower from step 3
-        //   for i in 1..C-1: attn2[i, :i] += (attn2[i, :i] * attn2[:i, :i]).sum(-1)
-        //   attn2 += eye(C)
-        solve_tril_kernel<scalar_t, CHUNK_SIZE>::apply(attn2, mb_size);
+        // step 4: solve_tril in float32; reuse tmp3 as scratch (overwritten by
+        // brgemm add_C=false in steps 5.c/5.g, so there is no conflict).
+        solve_tril_kernel<scalar_t, CHUNK_SIZE>::apply(attn2, tmp3, mb_size);
 
         // step 5: recompute_w_u
         //   w = attn2 @ (k_beta * g.exp().unsqueeze(-1))
