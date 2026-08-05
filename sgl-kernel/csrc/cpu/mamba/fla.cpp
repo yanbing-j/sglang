@@ -612,6 +612,64 @@ struct update_value_kernel<at::BFloat16, D> {
 };
 #endif
 
+// Variant of update_value_kernel where the input u is float32 (not bf16).
+// Used when u is stored as float32 to avoid the bf16 quantization loss.
+template <typename scalar_t, int D>
+struct update_value_f32_kernel {
+  static inline void apply(
+      scalar_t* __restrict__ v_prime2,
+      const float* __restrict__ u,
+      const float* __restrict__ v_prime,
+      int size,
+      int padded_size,
+      int u_strideT) {
+    TORCH_CHECK(false, "update_value_f32_kernel: scalar path not implemented!");
+  }
+};
+
+#if defined(CPU_CAPABILITY_AVX512)
+template <int D>
+struct update_value_f32_kernel<at::BFloat16, D> {
+  static inline void apply(
+      at::BFloat16* __restrict__ v_prime2,
+      const float* __restrict__ u,
+      const float* __restrict__ v_prime,
+      int size,
+      int padded_size,
+      int u_strideT) {
+    static_assert(D % 32 == 0);
+    constexpr int COLS = D / 16;
+
+    // v2' = u(f32) - v_prime(f32) → bf16
+    for (int i = 0; i < size; ++i) {
+      Unroll<COLS>{}([&](auto col) {
+        if constexpr (col % 2 == 0) {
+          __m512 va0 = _mm512_loadu_ps(u + i * u_strideT + (col + 0) * 16);
+          __m512 va1 = _mm512_loadu_ps(u + i * u_strideT + (col + 1) * 16);
+
+          __m512 vp0 = _mm512_loadu_ps(v_prime + i * D + (col + 0) * 16);
+          __m512 vp1 = _mm512_loadu_ps(v_prime + i * D + (col + 1) * 16);
+          va0 = _mm512_sub_ps(va0, vp0);
+          va1 = _mm512_sub_ps(va1, vp1);
+          __m512i o16 = (__m512i)(_mm512_cvtne2ps_pbh(va1, va0));
+          _mm512_storeu_si512(v_prime2 + i * D + col * 16, o16);
+        }
+      });
+    }
+
+    // pad the last chunk
+    for (int i = size; i < padded_size; ++i) {
+      Unroll<COLS>{}([&](auto col) {
+        if constexpr (col % 2 == 0) {
+          __m512i v16 = _mm512_setzero_si512();
+          _mm512_storeu_si512(v_prime2 + i * D + col * 16, v16);
+        }
+      });
+    }
+  }
+};
+#endif
+
 template <typename scalar_t, int CHUNK_SIZE, int D>
 struct update_key_kernel {
   static inline void apply(
@@ -773,7 +831,7 @@ void chunk_local_cumsum_kernel_impl(
 template <typename scalar_t, int D, int CHUNK_SIZE>
 void chunk_gated_delta_rule_fwd_intra_kernel_impl(
     scalar_t* __restrict__ w,
-    scalar_t* __restrict__ u,
+    float* __restrict__ u,
     float* __restrict__ d,
     const scalar_t* __restrict__ k,
     const scalar_t* __restrict__ v,
@@ -794,7 +852,7 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
   // strides
   const int64_t w_strideT = Hv * D;
   const int64_t w_strideH = D;
-  const int64_t u_strideT = Hv * D;
+  const int64_t u_strideT = Hv * D;  // stride in float32 elements
   const int64_t u_strideH = D;
 
   // [NB]: parallel on [NT, H]
@@ -933,9 +991,13 @@ void chunk_gated_delta_rule_fwd_intra_kernel_impl(
             /*     B */ v_beta_packed,
             /*     C */ v_updated);
 
-        // 5.h v_updated -> u
-        scalar_t* __restrict__ u_ptr = u + (batch_offset + mb_start) * u_strideT + hv * u_strideH;
-        update_kernel<scalar_t, D>::apply(u_ptr, v_updated, mb_size, D, u_strideT);
+        // 5.h v_updated (f32) -> u (f32, strided)
+        float* __restrict__ u_ptr = u + (batch_offset + mb_start) * u_strideT + hv * u_strideH;
+        for (int64_t m = 0; m < mb_size; ++m) {
+          Unroll<D / 16>{}([&](auto col) {
+            _mm512_storeu_ps(u_ptr + m * u_strideT + col * 16, _mm512_loadu_ps(v_updated + m * D + col * 16));
+          });
+        }
       }
 
       // move to the next index
@@ -964,7 +1026,7 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
     const scalar_t* __restrict__ q,
     const scalar_t* __restrict__ k,
     const scalar_t* __restrict__ w,
-    const scalar_t* __restrict__ u,
+    const float* __restrict__ u,
     const float* __restrict__ g,
     const float* __restrict__ d,
     const int32_t* __restrict__ cu_seqlens,
@@ -1076,9 +1138,9 @@ void chunk_gated_delta_rule_fwd_inter_kernel_impl(
             /*     B */ s_packed,
             /*     C */ v_prime);
 
-        // step 2.b: v2' = u - v'
-        const scalar_t* __restrict__ u_ptr = u + (batch_offset + mb_start) * u_strideT + hv * u_strideH;
-        update_value_kernel<scalar_t, D>::apply(v_prime2, u_ptr, v_prime, mb_size, padded_mb_size, u_strideT);
+        // step 2.b: v2' = u - v'  (u is float32, no bf16 conversion loss)
+        const float* __restrict__ u_ptr = u + (batch_offset + mb_start) * u_strideT + hv * u_strideH;
+        update_value_f32_kernel<scalar_t, D>::apply(v_prime2, u_ptr, v_prime, mb_size, padded_mb_size, u_strideT);
 
         // step 3.a: qg_exp = q * exp(g)
         apply_beta_kernel<scalar_t, CHUNK_SIZE, D, false, true>::apply(
@@ -1526,7 +1588,7 @@ at::Tensor chunk_local_cumsum(const at::Tensor& g, const at::Tensor& cu_seqlens,
 #define LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTRA_KERNEL(HD)                \
   chunk_gated_delta_rule_fwd_intra_kernel_impl<scalar_t, HD, CHUNK_SIZE>( \
       w.data_ptr<scalar_t>(),                                             \
-      u.data_ptr<scalar_t>(),                                             \
+      u.data_ptr<float>(),                                                \
       decay_mask.data_ptr<float>(),                                       \
       k.data_ptr<scalar_t>(),                                             \
       v.data_ptr<scalar_t>(),                                             \
@@ -1558,8 +1620,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_intra(
   int64_t Dv = v.size(3);
   int64_t NT = chunk_indices.size(0);
 
-  at::Tensor w = at::empty({B, T, Hv, D}, k.options());                                 // BFloat16
-  at::Tensor u = at::empty({B, T, Hv, Dv}, k.options());                                // BFloat16
+  at::Tensor w = at::empty({B, T, Hv, D}, k.options());   // BFloat16
+  at::Tensor u = at::empty({B, T, Hv, Dv}, g.options());  // Float32 (avoids bf16 round-trip in inter kernel)
   at::Tensor decay_mask = at::empty({B, NT, Hv, CHUNK_SIZE, CHUNK_SIZE}, g.options());  // Float
   AT_DISPATCH_REDUCED_FLOATING_TYPES(k.scalar_type(), "chunk_gated_delta_rule_fwd_intra", [&] {
     DISPATCH_HEAD_DIM(D, LAUNCH_CHUNK_GATED_DELTA_RULE_FWD_INTRA_KERNEL);
@@ -1576,7 +1638,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> chunk_gated_delta_rule_fwd_intra(
       q.data_ptr<scalar_t>(),                                             \
       k.data_ptr<scalar_t>(),                                             \
       w.data_ptr<scalar_t>(),                                             \
-      u.data_ptr<scalar_t>(),                                             \
+      u.data_ptr<float>(),                                                \
       g.data_ptr<float>(),                                                \
       decay_mask.data_ptr<float>(),                                       \
       cu_seqlens.data_ptr<int32_t>(),                                     \
