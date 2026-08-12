@@ -18,6 +18,9 @@ from sglang.test.cpu_test_utils import (
     unpack_and_dequant_awq,
     unpack_and_dequant_gptq,
 )
+from sglang.srt.hardware_backend.cpu.quantization.gptq_kernels import (
+    GPTQMarlinCPULinearKernel,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -574,6 +577,45 @@ class TestGemm(CustomTestCase):
 
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
+
+    @parametrize(
+        M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
+    )
+    def test_gptq_marlin_cpu(self, M, N, K, group_size, has_bias):
+        """GPTQMarlinCPULinearKernel: process_weights + apply matches int4 reference."""
+        torch.manual_seed(42)
+        gptq_weight = torch.randint(-128, 128, (K // 8, N)).to(torch.int)
+        gptq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
+        gptq_scales = torch.rand(K // group_size, N).to(torch.bfloat16) / 10
+        bias = torch.rand(N).to(torch.float) if has_bias else None
+        x = torch.rand(M, K).to(torch.bfloat16)
+
+        # Reference: direct int4_scaled_mm_cpu with packed weights
+        packed_weight, packed_zero, packed_scales = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                gptq_weight, gptq_zero, gptq_scales, 1
+            )
+        )
+        ref = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x, packed_weight, packed_zero, packed_scales, bias
+        )
+
+        # GPTQMarlinCPULinearKernel: process_weights then apply
+        layer = nn.Module()
+        layer.register_parameter(
+            "qweight", nn.Parameter(gptq_weight, requires_grad=False)
+        )
+        layer.register_parameter("qzeros", nn.Parameter(gptq_zero, requires_grad=False))
+        layer.register_parameter(
+            "scales", nn.Parameter(gptq_scales, requires_grad=False)
+        )
+
+        kernel = GPTQMarlinCPULinearKernel(quant_config=None)
+        kernel.process_weights_after_loading(layer)
+        out = kernel.apply(layer, x, bias)
+
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":

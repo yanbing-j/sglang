@@ -13,9 +13,13 @@ from sglang.srt.layers.moe import MoeRunnerConfig
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
-    from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig
+    from sglang.srt.layers.quantization.gptq.gptq import GPTQConfig, GPTQMarlinConfig
 
-__all__ = ["GPTQIntelAMXLinearKernel", "GPTQIntelAMXMoEKernel"]
+__all__ = [
+    "GPTQIntelAMXLinearKernel",
+    "GPTQIntelAMXMoEKernel",
+    "GPTQMarlinCPULinearKernel",
+]
 
 
 class GPTQIntelAMXLinearKernel:
@@ -98,3 +102,45 @@ class GPTQIntelAMXMoEKernel:
             True,  # is_vnni
         )
         return StandardCombineInput(hidden_states=output)
+
+
+class GPTQMarlinCPULinearKernel:
+    """CPU kernel for GPTQMarlin linear layers.
+
+    Reuses the existing int4_scaled_mm_cpu (AVX512/BRGEMM) path.
+    Weights are kept in standard GPTQ format (no Marlin-specific repacking).
+    """
+
+    # Accepts kernel_config assignment from GPTQMarlinLinearScheme.create_weights
+    # but does not use it (CPU uses int4_scaled_mm_cpu directly).
+    kernel_config = None
+
+    def __init__(self, quant_config: GPTQMarlinConfig):
+        self.quant_config = quant_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.quant_config is not None and getattr(self.quant_config, "desc_act", False):
+            raise ValueError(
+                "GPTQMarlin on CPU does not support desc_act with real g_idx shuffle. "
+                "Only desc_act=False (or static_groups with true_sequential) is supported."
+            )
+        _amx_process_weight_after_loading(
+            layer, ["qweight", "qzeros", "scales"], None, "gptq"
+        )
+        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x,
+            layer.qweight,
+            layer.qzeros,
+            layer.scales,
+            bias,
+        )

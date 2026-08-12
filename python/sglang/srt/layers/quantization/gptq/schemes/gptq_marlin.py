@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_repeat_scales_on_all_ranks,
     verify_marlin_supported,
 )
+from sglang.srt.utils import is_cpu
 
 from .gptq_scheme import GPTQLinearSchemeBase
 
@@ -25,18 +26,29 @@ if TYPE_CHECKING:
 
 __all__ = ["GPTQMarlinLinearScheme"]
 
+_is_cpu = is_cpu()
+
 
 class GPTQMarlinLinearScheme(GPTQLinearSchemeBase):
     def __init__(self, quant_config: GPTQMarlinConfig):
         self.quant_config = quant_config
         self.kernel = self._init_kernel(quant_config)
 
-        verify_marlin_supported(
-            quant_type=self.quant_config.quant_type,
-            group_size=self.quant_config.group_size,
-        )
+        # verify_marlin_supported checks GPU capability; skip on CPU
+        if not _is_cpu:
+            verify_marlin_supported(
+                quant_type=self.quant_config.quant_type,
+                group_size=self.quant_config.group_size,
+            )
 
     def _init_kernel(self, quant_config: GPTQMarlinConfig):
+        if _is_cpu:
+            from sglang.srt.hardware_backend.cpu.quantization.gptq_kernels import (
+                GPTQMarlinCPULinearKernel,
+            )
+
+            return GPTQMarlinCPULinearKernel(quant_config)
+
         from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
             GPTQMarlinLinearKernel,
         )
