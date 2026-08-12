@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.marlin_utils import verify_marlin_supports_shape
+from sglang.srt.utils import is_cpu
 
 from .awq_scheme import AWQLinearSchemeBase
 
@@ -15,6 +16,8 @@ if TYPE_CHECKING:
 
 __all__ = ["AWQMarlinLinearScheme"]
 
+_is_cpu = is_cpu()
+
 
 class AWQMarlinLinearScheme(AWQLinearSchemeBase):
     def __init__(self, quant_config: AWQMarlinConfig):
@@ -22,6 +25,13 @@ class AWQMarlinLinearScheme(AWQLinearSchemeBase):
         self.kernel = self._init_kernel(quant_config)
 
     def _init_kernel(self, quant_config: AWQMarlinConfig):
+        if _is_cpu:
+            from sglang.srt.hardware_backend.cpu.quantization.awq_kernels import (
+                AWQMarlinCPULinearKernel,
+            )
+
+            return AWQMarlinCPULinearKernel(quant_config)
+
         from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
             AWQMarlinLinearKernel,
         )
@@ -46,11 +56,15 @@ class AWQMarlinLinearScheme(AWQLinearSchemeBase):
             else input_size
         )
 
-        verify_marlin_supports_shape(
-            output_size_per_partition=output_size_per_partition,
-            input_size_per_partition=input_size_per_partition,
-            input_size=input_size,
-            group_size=group_size,
+        (
+            verify_marlin_supports_shape(
+                output_size_per_partition=output_size_per_partition,
+                input_size_per_partition=input_size_per_partition,
+                input_size=input_size,
+                group_size=group_size,
+            )
+            if not _is_cpu
+            else None
         )
 
         qweight = PackedvLLMParameter(

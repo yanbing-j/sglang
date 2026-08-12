@@ -13,9 +13,13 @@ from sglang.srt.layers.moe import MoeRunnerConfig
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
-    from sglang.srt.layers.quantization.awq.awq import AWQConfig
+    from sglang.srt.layers.quantization.awq.awq import AWQConfig, AWQMarlinConfig
 
-__all__ = ["AWQIntelAMXLinearKernel", "AWQIntelAMXMoEKernel"]
+__all__ = [
+    "AWQIntelAMXLinearKernel",
+    "AWQIntelAMXMoEKernel",
+    "AWQMarlinCPULinearKernel",
+]
 
 
 class AWQIntelAMXLinearKernel:
@@ -98,3 +102,39 @@ class AWQIntelAMXMoEKernel:
             True,  # is_vnni
         )
         return StandardCombineInput(hidden_states=output)
+
+
+class AWQMarlinCPULinearKernel:
+    """CPU kernel for AWQMarlin linear layers.
+
+    Reuses the existing int4_scaled_mm_cpu (AVX512/BRGEMM) path.
+    Weights are kept in standard AWQ format (no Marlin-specific repacking).
+    """
+
+    # Accepts kernel_config assignment from create_weights but does not use it.
+    kernel_config = None
+
+    def __init__(self, quant_config: AWQMarlinConfig):
+        self.quant_config = quant_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        _amx_process_weight_after_loading(
+            layer, ["qweight", "qzeros", "scales"], None, "awq"
+        )
+        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x,
+            layer.qweight,
+            layer.qzeros,
+            layer.scales,
+            bias,
+        )

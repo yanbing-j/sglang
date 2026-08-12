@@ -18,6 +18,9 @@ from sglang.test.cpu_test_utils import (
     unpack_and_dequant_awq,
     unpack_and_dequant_gptq,
 )
+from sglang.srt.hardware_backend.cpu.quantization.awq_kernels import (
+    AWQMarlinCPULinearKernel,
+)
 from sglang.srt.hardware_backend.cpu.quantization.gptq_kernels import (
     GPTQMarlinCPULinearKernel,
 )
@@ -611,6 +614,46 @@ class TestGemm(CustomTestCase):
         )
 
         kernel = GPTQMarlinCPULinearKernel(quant_config=None)
+        kernel.process_weights_after_loading(layer)
+        out = kernel.apply(layer, x, bias)
+
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    @parametrize(
+        M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
+    )
+    def test_awq_marlin_cpu(self, M, N, K, group_size, has_bias):
+        """AWQMarlinCPULinearKernel: process_weights + apply matches int4 reference."""
+        torch.manual_seed(42)
+        # AWQ packing: [K, N/8] int32 (packed_dim=1, along N)
+        awq_weight = torch.randint(-128, 128, (K, N // 8)).to(torch.int)
+        awq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
+        awq_scales = torch.rand(K // group_size, N).to(torch.bfloat16) / 10
+        bias = torch.rand(N).to(torch.float) if has_bias else None
+        x = torch.rand(M, K).to(torch.bfloat16)
+
+        # Reference: direct int4_scaled_mm_cpu with packed weights (AWQ format=0)
+        packed_weight, packed_zero, packed_scales = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                awq_weight, awq_zero, awq_scales, 0
+            )
+        )
+        ref = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x, packed_weight, packed_zero, packed_scales, bias
+        )
+
+        # AWQMarlinCPULinearKernel: process_weights then apply
+        layer = nn.Module()
+        layer.register_parameter(
+            "qweight", nn.Parameter(awq_weight, requires_grad=False)
+        )
+        layer.register_parameter("qzeros", nn.Parameter(awq_zero, requires_grad=False))
+        layer.register_parameter(
+            "scales", nn.Parameter(awq_scales, requires_grad=False)
+        )
+
+        kernel = AWQMarlinCPULinearKernel(quant_config=None)
         kernel.process_weights_after_loading(layer)
         out = kernel.apply(layer, x, bias)
 
