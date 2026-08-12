@@ -2,6 +2,8 @@ import unittest
 
 # TODO: use interface in cpu.py
 import sgl_kernel  # noqa: F401
+import gguf
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -22,6 +24,9 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     static_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
+from sglang.srt.layers.quantization.gguf import (
+    fused_mul_mat_gguf_cpu,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
@@ -389,14 +394,18 @@ class TestGemm(CustomTestCase):
 
             quantized_static, returned_scale = scaled_fp8_quant(x, scale)
             self.assertIs(returned_scale, scale)
-            torch.testing.assert_close(quantized_static.float(), expected_quantized.float())
+            torch.testing.assert_close(
+                quantized_static.float(), expected_quantized.float()
+            )
 
             quantized_padded, scale_padded = scaled_fp8_quant(
                 x, None, num_token_padding=8
             )
             self.assertEqual(quantized_padded.shape, (8, 19))
             torch.testing.assert_close(scale_padded, scale)
-            torch.testing.assert_close(quantized_padded[: x.shape[0]].float(), quantized.float())
+            torch.testing.assert_close(
+                quantized_padded[: x.shape[0]].float(), quantized.float()
+            )
 
             per_token_quantized, per_token_scale = scaled_fp8_quant(
                 x, None, use_per_token_if_dynamic=True
@@ -410,7 +419,9 @@ class TestGemm(CustomTestCase):
                 .to(torch.float8_e4m3fn)
             )
             torch.testing.assert_close(per_token_scale, expected_per_token_scale)
-            torch.testing.assert_close(per_token_quantized.float(), expected_per_token_quantized.float())
+            torch.testing.assert_close(
+                per_token_quantized.float(), expected_per_token_quantized.float()
+            )
 
     def test_mxfp8_group_quantize_cpu(self):
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
@@ -473,6 +484,61 @@ class TestGemm(CustomTestCase):
             torch.testing.assert_close(
                 quantized.float(), expected_quantized.float(), rtol=0.20, atol=2.0
             )
+
+    def test_gguf_linear_cpu(self):
+        """Verify weights stay quantized and AVX512 path matches numpy reference."""
+        for qweight_type in [
+            gguf.GGMLQuantizationType.Q8_0,
+            gguf.GGMLQuantizationType.Q4_0,
+        ]:
+            N, K = 4, 64  # K must be divisible by 32
+            weight_f32 = (torch.randn(N, K) / 4).contiguous()
+            qweight_np = gguf.quantize(
+                weight_f32.numpy().astype(np.float32), qweight_type
+            )
+
+            # gguf.quantize may return various shapes (e.g. (n_blocks, type_size)).
+            # Reshape to [N, packed_cols] which is the format expected by both the
+            # C++ kernel and the actual model weight loading path.
+            block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+            packed_cols = (K // block_size) * type_size
+            qweight_bytes = np.frombuffer(qweight_np.tobytes(), dtype=np.uint8)
+            qweight = torch.from_numpy(qweight_bytes.reshape(N, packed_cols).copy())
+
+            # Weights must remain in quantized (non-float) format
+            self.assertEqual(qweight.dtype, torch.uint8)
+
+            # Reference: numpy dequantize → matmul
+            ref_weight = (
+                torch.from_numpy(gguf.dequantize(qweight_np, qweight_type))
+                .to(torch.bfloat16)
+                .reshape(N, K)
+            )
+
+            for M in [1, 4]:  # decode (M=1) and prefill (M>1)
+                x = torch.randn(M, K, dtype=torch.bfloat16)
+                out = fused_mul_mat_gguf_cpu(x, qweight, int(qweight_type))
+                expected = x @ ref_weight.T
+
+                self.assertEqual(out.shape, (M, N))
+                self.assertEqual(out.dtype, torch.bfloat16)
+                torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+        # Empty batch: no error, zero-row output
+        qw_np = gguf.quantize(
+            torch.zeros(4, 64).numpy().astype(np.float32),
+            gguf.GGMLQuantizationType.Q8_0,
+        )
+        qw_bytes = np.frombuffer(qw_np.tobytes(), dtype=np.uint8)
+        qw = torch.from_numpy(
+            qw_bytes.reshape(4, 68).copy()
+        )  # Q8_0: 2 blocks/row × 34 B = 68
+        out_empty = fused_mul_mat_gguf_cpu(
+            torch.empty(0, 64, dtype=torch.bfloat16),
+            qw,
+            int(gguf.GGMLQuantizationType.Q8_0),
+        )
+        self.assertEqual(out_empty.shape, (0, 4))
 
     @parametrize(
         M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]

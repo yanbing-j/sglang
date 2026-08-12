@@ -26,7 +26,15 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, set_weight_attrs
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    is_xpu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -39,6 +47,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import moe_align_block_size, moe_sum
@@ -62,11 +71,13 @@ elif _is_musa:
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
-elif _is_npu:
+elif _is_npu or _is_cpu:
     from gguf import dequantize as gguf_dequantize
 else:
     if not _is_hip:
-        warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
+        warnings.warn(
+            f"Only CUDA, MUSA, NPU and CPU support GGUF quantization currently."
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -169,9 +180,40 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 
+def fused_mul_mat_gguf_cpu(
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
+) -> torch.Tensor:
+    """CPU implementation of fused_mul_mat_gguf.
+
+    Q8_0 and Q4_0: AVX512 optimized on-the-fly dequant (no weight materialization for M=1).
+    Other types: numpy dequantize fallback (same semantics as GPU DEQUANT_TYPES path).
+    """
+    if x.shape[0] == 0:
+        return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
+    if qweight_type in UNQUANTIZED_TYPES:
+        return x @ qweight.T
+
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    N = qweight.shape[0]
+    K = qweight.shape[1] // type_size * block_size
+
+    # AVX512 path for Q8_0 (type=8) and Q4_0 (type=2)
+    if int(qweight_type) in (int(WeightType.Q8_0), int(WeightType.Q4_0)):
+        return torch.ops.sgl_kernel.gguf_mul_mat_cpu(
+            x.contiguous(), qweight.contiguous(), int(qweight_type), N, K
+        ).to(x.dtype)
+
+    # Fallback for other quantization types (K-quants, I-matrix, etc.)
+    weight_np = gguf_dequantize(qweight.contiguous().numpy(), qweight_type)
+    weight = torch.from_numpy(weight_np).to(dtype=x.dtype).reshape(N, K)
+    return x @ weight.T
+
+
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
+    if _is_cpu:
+        return fused_mul_mat_gguf_cpu(x, qweight, qweight_type)
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:

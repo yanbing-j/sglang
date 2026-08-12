@@ -697,6 +697,11 @@ def register_fake_ops(tp_size: int):
         )
         return act_quant, scale
 
+    @torch.library.register_fake("sgl_kernel::gguf_mul_mat_cpu")
+    def _(x, qweight, qtype, N, K):
+        M = x.numel() // K
+        return x.new_empty((M, N))
+
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
 # Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.
