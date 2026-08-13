@@ -20,10 +20,57 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
 SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
+CPU_FP8_W8A16_BLOCK_SIZE = [64, 128]
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+
+
+def _requantize_weight_to_cpu_block_fp8(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    block_size_n, block_size_k = CPU_FP8_W8A16_BLOCK_SIZE
+    n, k = weight.shape
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    eps = torch.finfo(torch.float32).eps
+
+    scale = weight_scale.reshape(-1)
+    if scale.numel() == 1:
+        scale = scale.expand(n)
+    elif scale.numel() != n:
+        assert n % scale.numel() == 0
+        scale = scale.repeat_interleave(n // scale.numel())
+
+    dequant_weight = weight.float() * scale.reshape(n, 1)
+    block_scales = torch.empty(
+        (
+            (n + block_size_n - 1) // block_size_n,
+            (k + block_size_k - 1) // block_size_k,
+        ),
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+
+    for n_start in range(0, n, block_size_n):
+        n_end = min(n_start + block_size_n, n)
+        n_idx = n_start // block_size_n
+        for k_start in range(0, k, block_size_k):
+            k_end = min(k_start + block_size_k, k)
+            k_idx = k_start // block_size_k
+            block = dequant_weight[n_start:n_end, k_start:k_end]
+            block_scale = (block.abs().max() / fp8_max).clamp(min=eps)
+            block_scales[n_idx, k_idx] = block_scale
+            qweight[n_start:n_end, k_start:k_end] = (
+                (block / block_scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+            )
+
+    return qweight, block_scales
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
@@ -50,6 +97,22 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
             layer.weight_scale = torch.nn.Parameter(
                 layer.weight_scale.data, requires_grad=False
             )
+
+        if _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "CompressedTensorsW8A16Fp8 on CPU requires AMX support"
+            weight, weight_scale = _requantize_weight_to_cpu_block_fp8(
+                layer.weight, layer.weight_scale
+            )
+            layer.weight = torch.nn.Parameter(
+                torch.ops.sgl_kernel.convert_weight_packed(weight.contiguous()),
+                requires_grad=False,
+            )
+            layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+            layer.weight_block_size = CPU_FP8_W8A16_BLOCK_SIZE
+            layer.use_intel_amx_backend = True
+            return
 
         # Weights must be transposed for marlin
         layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
@@ -125,6 +188,19 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_cpu:
+            input_2d = x.reshape(-1, x.shape[-1])
+            output = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                input_2d,
+                layer.weight,
+                layer.weight_scale,
+                layer.weight_block_size,
+                bias,
+                x.dtype,
+                True,
+            )
+            return output.reshape(*x.shape[:-1], layer.output_size_per_partition)
+
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,
