@@ -67,11 +67,13 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -351,7 +353,15 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_config_filenames(cls) -> List[str]:
         return []
 
-    def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+    def _check_scheme_supported(
+        self, min_capability: int, error: bool = True, allow_cpu: bool = False
+    ) -> bool:
+        if _is_cpu:
+            supported = allow_cpu and _is_cpu_amx_available
+            if error and not supported:
+                raise RuntimeError("Quantization scheme is not supported on CPU.")
+            return supported
+
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
         if capability_tuple is not None:
@@ -658,7 +668,9 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
                 is_fp8_w8a8_supported = self._check_scheme_supported(
-                    CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+                    CompressedTensorsW8A8Fp8.get_min_capability(),
+                    error=False,
+                    allow_cpu=True,
                 )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
@@ -894,7 +906,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
         if not _is_npu:
-            self._check_scheme_supported(scheme.get_min_capability())
+            self._check_scheme_supported(
+                scheme.get_min_capability(),
+                allow_cpu=isinstance(scheme, CompressedTensorsW8A8Fp8),
+            )
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
 

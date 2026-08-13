@@ -28,11 +28,13 @@ from sglang.srt.layers.quantization.fp8_utils import (
     validate_fp8_block_shape,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -150,6 +152,24 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 logical_widths=layer.logical_widths,
             )
 
+            if _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "CompressedTensorsW8A8Fp8 on CPU requires AMX support"
+                weight_scale = max_w_scale.reshape(1, 1).expand(weight.size(0), 1)
+                q_weight, weight_scale = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+                    weight.contiguous(), weight_scale.to(torch.float32).contiguous()
+                )
+                layer.weight = Parameter(q_weight, requires_grad=False)
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                layer.input_scale = (
+                    Parameter(layer.input_scale.max(), requires_grad=False)
+                    if self.is_static_input_scheme
+                    else None
+                )
+                layer.use_intel_amx_backend = True
+                return
+
             if is_fp8_fnuz():
                 input_scale = getattr(layer, "input_scale", None)
 
@@ -176,6 +196,23 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
             else:
                 weight_scale = layer.weight_scale.data
+
+            if _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "CompressedTensorsW8A8Fp8 on CPU requires AMX support"
+                q_weight, weight_scale = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+                    weight.contiguous(), weight_scale.to(torch.float32).contiguous()
+                )
+                layer.weight = Parameter(q_weight, requires_grad=False)
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                layer.input_scale = (
+                    Parameter(layer.input_scale.max(), requires_grad=False)
+                    if self.is_static_input_scheme
+                    else None
+                )
+                layer.use_intel_amx_backend = True
+                return
 
             if _use_aiter:
                 # keep the weight as (N, K)

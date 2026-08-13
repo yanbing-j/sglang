@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm90_supported = is_sm90_supported()
 _is_sm100_supported = is_sm100_supported()
@@ -1771,7 +1772,35 @@ def apply_fp8_linear(
 
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[1]]
+    output_size = (
+        weight.shape[0] * weight.shape[-1]
+        if _is_cpu and weight.dim() == 4
+        else weight.shape[1]
+    )
+    output_shape = [*input.shape[:-1], output_size]
+
+    if _is_cpu:
+        if weight.dim() != 4:
+            raise RuntimeError(
+                "apply_fp8_linear on CPU expects prepacked weight from "
+                "torch.ops.sgl_kernel.float8_linear_prepack_cpu"
+            )
+        if input_scale is not None:
+            input_scale = input_scale.reshape(-1)
+            if input_scale.numel() != 1:
+                raise RuntimeError(
+                    "apply_fp8_linear on CPU only supports scalar static input scale"
+                )
+        output = torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+            input_2d,
+            input_scale,
+            input_scale is None,
+            weight,
+            weight_scale,
+            bias,
+            input.dtype,
+        )
+        return output.view(*output_shape)
 
     # A pre-quantized fp8 activation (e.g. from a fused RMSNorm+quant kernel)
     # carries no original dtype: skip re-quant, reuse the supplied per-tensor
