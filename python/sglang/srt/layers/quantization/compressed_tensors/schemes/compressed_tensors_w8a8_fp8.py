@@ -8,7 +8,10 @@ import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn import Parameter
 
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+    sglang_per_token_group_quant_fp8_cpu,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -227,6 +230,27 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
+            if _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "CompressedTensorsW8A8Fp8 on CPU requires AMX support"
+                if layer.weight_scale.size(0) != layer.weight.size(0):
+                    block_n = self.weight_block_size[0]
+                    weight_scale = torch.repeat_interleave(
+                        layer.weight_scale, block_n, 0
+                    )[: layer.weight.size(0), :].contiguous()
+                else:
+                    weight_scale = layer.weight_scale
+                q_weight, weight_scale = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+                    layer.weight.contiguous(),
+                    weight_scale.to(torch.float32).contiguous(),
+                )
+                layer.weight = Parameter(q_weight, requires_grad=False)
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                layer.input_scale = None
+                layer.use_intel_amx_backend = True
+                return
+
             if is_fp8_fnuz():
                 weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=layer.weight, weight_scale=layer.weight_scale
@@ -286,6 +310,25 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 pre_quant_output_dtype=out_dtype,
             )
         if self.weight_block_size is not None:
+            if _is_cpu:
+                x_2d = x.view(-1, x.shape[-1])
+                _, block_k = self.weight_block_size
+                qx, x_scale = sglang_per_token_group_quant_fp8_cpu(
+                    x_2d,
+                    block_k,
+                )
+                output = torch.ops.sgl_kernel.float8_linear_cpu(
+                    qx,
+                    x_scale,
+                    layer.weight,
+                    layer.weight_scale,
+                    bias,
+                    x.dtype,
+                )
+                return output.view(
+                    *x.shape[:-1], layer.weight.shape[0] * layer.weight.shape[-1]
+                )
+
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
