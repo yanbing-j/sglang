@@ -23,10 +23,70 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     fp4_quantize,
 )
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsW4A4Fp4"]
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+
+_FP4_E2M1_LUT = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
+
+
+def _convert_swizzled_to_linear(
+    scale: torch.Tensor, rows: int, cols: int, block_size: int = 16
+) -> torch.Tensor:
+    row_tiles = (rows + 127) // 128
+    col_tiles = (cols + block_size * 4 - 1) // (block_size * 4)
+    scale = scale.reshape(1, row_tiles, col_tiles, 32, 4, 4)
+    scale = scale.permute(0, 1, 4, 3, 2, 5)
+    return scale.reshape(row_tiles * 128, col_tiles * 4)[:rows, : cols // block_size]
+
+
+def _dequantize_nvfp4_linear(
+    value: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    scale_is_swizzled: bool,
+) -> torch.Tensor:
+    rows, half_cols = value.shape
+    cols = half_cols * 2
+    low = (value & 0xF).to(torch.int64)
+    high = (value >> 4).to(torch.int64)
+    lut = _FP4_E2M1_LUT.to(device=value.device)
+    dequant = torch.empty((rows, cols), dtype=torch.float32, device=value.device)
+    dequant[:, 0::2] = lut[low]
+    dequant[:, 1::2] = lut[high]
+
+    scale = scale.view(torch.float8_e4m3fn)
+    if scale_is_swizzled:
+        scale = _convert_swizzled_to_linear(scale, rows, cols)
+    scale = scale.to(torch.float32) / global_scale.to(torch.float32)
+    return (dequant * scale.repeat_interleave(16, dim=-1)).to(out_dtype)
 
 
 class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
@@ -50,6 +110,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.params_dtype = params_dtype
 
         # Weight
         weight = ModelWeightParameter(
@@ -99,6 +160,28 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
+        if _is_cpu:
+            assert (
+                _is_cpu_amx_available
+            ), "CompressedTensorsW4A4Fp4 on CPU requires AMX support"
+            weight = _dequantize_nvfp4_linear(
+                layer.weight_packed.data,
+                layer.weight_scale.data,
+                layer.weight_global_scale,
+                layer.params_dtype,
+                scale_is_swizzled=False,
+            )
+            packed_weight = torch.ops.sgl_kernel.convert_weight_packed(
+                weight.contiguous()
+            )
+            layer.weight_packed = Parameter(packed_weight, requires_grad=False)
+            layer.weight_scale = Parameter(
+                torch.empty(0, dtype=torch.float8_e4m3fn, device=weight.device),
+                requires_grad=False,
+            )
+            layer.use_intel_amx_backend = True
+            return
+
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
@@ -138,11 +221,27 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         output_dtype = x.dtype
-        w_n, _ = layer.weight_packed.shape
+        w_n = layer.output_size_per_partition
         output_shape = [x.shape[0], w_n]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
+
+        if x.device.type == "cpu":
+            x_dequant = _dequantize_nvfp4_linear(
+                x_fp4.reshape(-1, x_fp4.shape[-1]),
+                x_blockscale,
+                layer.input_global_scale,
+                output_dtype,
+                scale_is_swizzled=True,
+            )
+            out = torch.ops.sgl_kernel.weight_packed_linear(
+                x_dequant.contiguous(),
+                layer.weight_packed,
+                bias,
+                True,
+            )
+            return out.reshape(*output_shape)
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight_packed.dtype == torch.uint8

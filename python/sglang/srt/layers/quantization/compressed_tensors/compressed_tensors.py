@@ -657,7 +657,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         if is_activation_quantization_format(quant_format):
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
                 is_fp4a4_nvfp4_supported = self._check_scheme_supported(
-                    CompressedTensorsW4A4Fp4.get_min_capability(), error=False
+                    CompressedTensorsW4A4Fp4.get_min_capability(),
+                    error=False,
+                    allow_cpu=True,
                 )
                 if is_fp4a4_nvfp4_supported:
                     return CompressedTensorsW4A4Fp4()
@@ -914,6 +916,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                         CompressedTensorsW8A8Fp8,
                         CompressedTensorsW8A16Fp8,
                         CompressedTensorsW8A8Int8,
+                        CompressedTensorsW4A4Fp4,
                         CompressedTensorsWNA16,
                     ),
                 ),

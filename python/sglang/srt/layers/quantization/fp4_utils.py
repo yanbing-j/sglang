@@ -19,14 +19,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-fp4_quantize = None
+_flashinfer_fp4_quantize_op = None
+
+
+def _round_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
+
+
 try:
     from flashinfer import fp4_quantize as _flashinfer_fp4_quantize
 
     _flashinfer_fp4_quantize_backend = "cute-dsl" if is_sm100_supported() else "cuda"
-
-    def _round_up(x: int, y: int) -> int:
-        return ((x + y - 1) // y) * y
 
     def _flashinfer_fp4_quantize_impl(
         input: torch.Tensor,
@@ -81,13 +84,47 @@ try:
             sf = input.new_empty((sf_rows, sf_cols), dtype=torch.uint8)
         return x_q, sf
 
-    fp4_quantize = register_custom_op_from_extern(
+    _flashinfer_fp4_quantize_op = register_custom_op_from_extern(
         _flashinfer_fp4_quantize_impl,
         op_name="flashinfer_fp4_quantize",
         fake_impl=_flashinfer_fp4_quantize_fake,
     )
 except ImportError:
-    fp4_quantize = None
+    _flashinfer_fp4_quantize_op = None
+
+
+def fp4_quantize(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+    sf_vec_size: int = 16,
+    sf_use_ue8m0: bool = False,
+    is_sf_swizzled_layout: bool = True,
+    is_sf_8x4_layout: bool = False,
+    enable_pdl: Optional[bool] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if input.device.type == "cpu":
+        if enable_pdl:
+            raise NotImplementedError("CPU fp4_quantize does not support enable_pdl.")
+        return torch.ops.sgl_kernel.fp4_quantize_cpu(
+            input.contiguous(),
+            global_scale,
+            sf_vec_size,
+            sf_use_ue8m0,
+            is_sf_swizzled_layout,
+            is_sf_8x4_layout,
+        )
+
+    if _flashinfer_fp4_quantize_op is None:
+        raise RuntimeError("NVFP4 quantization requires flashinfer on non-CPU devices.")
+    return _flashinfer_fp4_quantize_op(
+        input=input,
+        global_scale=global_scale,
+        sf_vec_size=sf_vec_size,
+        sf_use_ue8m0=sf_use_ue8m0,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        is_sf_8x4_layout=is_sf_8x4_layout,
+        enable_pdl=enable_pdl,
+    )
 
 
 class Fp4GemmRunnerBackend(Enum):

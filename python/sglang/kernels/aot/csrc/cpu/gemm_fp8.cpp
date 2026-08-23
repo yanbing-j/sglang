@@ -1,7 +1,8 @@
-#include <cstring>
-#include <cstdint>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+
 #include "common.h"
 #include "gemm.h"
 #include "vec.h"
@@ -1191,7 +1192,8 @@ void quantize_fp8e4m3_cpu_kernel(
     }
     for (; element_index <= end - 16; element_index += 16) {
       __m512 value_vec = load_16_as_fp32(input_data + element_index);
-      __m512 clamped_vec = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(value_vec, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
+      __m512 clamped_vec =
+          _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(value_vec, inv_scale_vec), neg_quant_max_vec), quant_max_vec);
       _mm_storeu_si128(reinterpret_cast<__m128i*>(output_data + element_index), cvtfp32_fp8e4m3(clamped_vec));
     }
 
@@ -1297,7 +1299,12 @@ std::tuple<at::Tensor, at::Tensor> scaled_fp8_quant_cpu(
     switch (input_dtype) {
       case at::kFloat:
         per_token_group_quant_fp8_cpu_kernel(
-            input.data_ptr<float>(), output.data_ptr<at::Float8_e4m3fn>(), scale.data_ptr<float>(), num_rows, row_size, 1e-12f);
+            input.data_ptr<float>(),
+            output.data_ptr<at::Float8_e4m3fn>(),
+            scale.data_ptr<float>(),
+            num_rows,
+            row_size,
+            1e-12f);
         break;
       case at::kHalf:
         per_token_group_quant_fp8_cpu_kernel(
@@ -1434,6 +1441,249 @@ std::tuple<at::Tensor, at::Tensor> mxfp8_group_quantize_cpu(const at::Tensor& in
         break;
       default:
         TORCH_CHECK(false, "mxfp8_group_quantize_cpu: unsupported input dtype");
+    }
+  }
+
+  return std::make_tuple(output, scale);
+}
+
+inline __m128i nvfp4_cvtfp32_fp8e4m3(__m512& src) {
+  const __m512i sign_mask = _mm512_set1_epi32(0x80000000);
+  const __m512i fp8_max = _mm512_set1_epi32(UINT32_C(1087) << 20);
+  const __m512i denorm_thresh = _mm512_set1_epi32(UINT32_C(121) << 23);
+  const __m512i denorm_mask = _mm512_set1_epi32(UINT32_C(141) << 23);
+  const __m512i bias_part1 = _mm512_set1_epi32((uint32_t)(7 - 127) << 23);
+  const __m512i rounding_bias = _mm512_set1_epi32(0x7FFFF);
+  __m512i f_bits = _mm512_castps_si512(src);
+  __m512i sign = _mm512_and_epi32(f_bits, sign_mask);
+  f_bits = _mm512_xor_epi32(f_bits, sign);
+
+  __m512i result = _mm512_setzero_si512();
+  __mmask16 overflow_mask = _mm512_cmpge_epu32_mask(f_bits, fp8_max);
+  result = _mm512_mask_set1_epi32(result, overflow_mask, 0x7f);
+
+  __mmask16 denorm_thresh_mask = _mm512_cmplt_epu32_mask(f_bits, denorm_thresh);
+  if (denorm_thresh_mask) {
+    __m512 small_input = _mm512_castsi512_ps(f_bits);
+    __m512 small_denorm = _mm512_add_ps(small_input, _mm512_castsi512_ps(denorm_mask));
+    __m512i small_denorm_bits = _mm512_castps_si512(small_denorm);
+    __m512i small_result = _mm512_sub_epi32(small_denorm_bits, denorm_mask);
+    result = _mm512_mask_mov_epi32(result, denorm_thresh_mask, small_result);
+  }
+
+  __mmask16 normal_mask = ~(overflow_mask | denorm_thresh_mask);
+  if (normal_mask) {
+    __m512i mant_odd = _mm512_and_epi32(_mm512_srli_epi32(f_bits, 20), _mm512_set1_epi32(1));
+    __m512i rounded = _mm512_add_epi32(f_bits, bias_part1);
+    rounded = _mm512_add_epi32(rounded, rounding_bias);
+    rounded = _mm512_add_epi32(rounded, mant_odd);
+    __m512i normal_result = _mm512_srli_epi32(rounded, 20);
+    result = _mm512_mask_mov_epi32(result, normal_mask, normal_result);
+  }
+
+  __m512i sign_shifted = _mm512_srli_epi32(sign, 24);
+  result = _mm512_or_epi32(result, sign_shifted);
+  return _mm512_cvtepi32_epi8(_mm512_and_si512(result, _mm512_set1_epi32(0xFF)));
+}
+
+inline __m512 nvfp4_load_16_as_fp32(const float* __restrict__ input) {
+  return _mm512_loadu_ps(input);
+}
+
+inline __m512 nvfp4_load_16_as_fp32(const at::Half* __restrict__ input) {
+  return CVT_FP16_TO_FP32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(input)));
+}
+
+inline __m512 nvfp4_load_16_as_fp32(const at::BFloat16* __restrict__ input) {
+  __m256i input_bf16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input));
+  return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(input_bf16), 16));
+}
+
+inline uint8_t fp8e4m3_byte(float value) {
+  __m512 value_vec = _mm512_set1_ps(value);
+  __m128i byte_vec = nvfp4_cvtfp32_fp8e4m3(value_vec);
+  return static_cast<uint8_t>(_mm_extract_epi8(byte_vec, 0));
+}
+
+inline float fp8e4m3_byte_to_float(uint8_t value) {
+  at::Float8_e4m3fn scale;
+  std::memcpy(&scale, &value, sizeof(value));
+  return static_cast<float>(scale);
+}
+
+inline int64_t nvfp4_round_up(int64_t x, int64_t y) {
+  return ((x + y - 1) / y) * y;
+}
+
+inline int64_t nvfp4_swizzled_scale_offset(int64_t row, int64_t col, int64_t cols, int64_t row_tile_size) {
+  const int64_t row_tile = row / row_tile_size;
+  const int64_t row_in_tile = row % row_tile_size;
+  const int64_t row_subtile = row_in_tile / 32;
+  const int64_t row_inner = row_in_tile % 32;
+  const int64_t col_tile = col / 4;
+  const int64_t col_inner = col % 4;
+  const int64_t col_tiles = cols / 4;
+  return (((row_tile * col_tiles + col_tile) * 32 + row_inner) * (row_tile_size / 32) + row_subtile) * 4 + col_inner;
+}
+
+inline uint8_t pack_fp4_e2m1_pair(float low_value, float high_value) {
+  auto quantize_one = [](float value) -> uint8_t {
+    const float abs_value = std::min(std::abs(value), 6.0f);
+    uint8_t code;
+    if (abs_value <= 0.25f) {
+      code = 0;
+    } else if (abs_value < 0.75f) {
+      code = 1;
+    } else if (abs_value <= 1.25f) {
+      code = 2;
+    } else if (abs_value < 1.75f) {
+      code = 3;
+    } else if (abs_value <= 2.5f) {
+      code = 4;
+    } else if (abs_value < 3.5f) {
+      code = 5;
+    } else if (abs_value <= 5.0f) {
+      code = 6;
+    } else {
+      code = 7;
+    }
+    if (std::signbit(value)) {
+      code |= 0x8;
+    }
+    return code;
+  };
+  return quantize_one(low_value) | (quantize_one(high_value) << 4);
+}
+
+template <typename scalar_t>
+void fp4_quantize_cpu_kernel(
+    const scalar_t* __restrict__ input_data,
+    uint8_t* __restrict__ output_data,
+    uint8_t* __restrict__ scale_data,
+    int64_t rows,
+    int64_t cols,
+    int64_t scale_cols,
+    int64_t swizzled_scale_cols,
+    int64_t scale_row_size,
+    float global_scale,
+    bool is_sf_swizzled_layout) {
+  constexpr int64_t group_size = 16;
+  constexpr float fp4_max = 6.0f;
+  const __m512 sign_bit = _mm512_set1_ps(-0.0f);
+
+  at::parallel_for(0, rows * scale_cols, 0, [&](int64_t begin, int64_t end) {
+    alignas(64) float scaled_values[group_size];
+    for (int64_t group_index = begin; group_index < end; ++group_index) {
+      const int64_t row = group_index / scale_cols;
+      const int64_t scale_col = group_index % scale_cols;
+      const int64_t input_offset = row * cols + scale_col * group_size;
+      __m512 value_vec = nvfp4_load_16_as_fp32(input_data + input_offset);
+      const float absmax = _mm512_reduce_max_ps(_mm512_andnot_ps(sign_bit, value_vec));
+
+      const float fp8_scale = absmax * global_scale / fp4_max;
+      const uint8_t scale_byte = fp8e4m3_byte(fp8_scale);
+      const int64_t scale_offset =
+          is_sf_swizzled_layout ? nvfp4_swizzled_scale_offset(row, scale_col, swizzled_scale_cols, scale_row_size)
+                                : row * swizzled_scale_cols + scale_col;
+      scale_data[scale_offset] = scale_byte;
+
+      const float scale_value = fp8e4m3_byte_to_float(scale_byte);
+      const float inv_scale = scale_value == 0.0f ? 0.0f : global_scale / scale_value;
+      __m512 scaled_vec = _mm512_mul_ps(value_vec, _mm512_set1_ps(inv_scale));
+      _mm512_store_ps(scaled_values, scaled_vec);
+
+      uint8_t* output_row = output_data + row * (cols / 2) + scale_col * (group_size / 2);
+      for (int64_t i = 0; i < group_size; i += 2) {
+        output_row[i / 2] = pack_fp4_e2m1_pair(scaled_values[i], scaled_values[i + 1]);
+      }
+    }
+  });
+}
+
+std::tuple<at::Tensor, at::Tensor> fp4_quantize_cpu(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& global_scale_opt,
+    int64_t sf_vec_size,
+    bool sf_use_ue8m0,
+    bool is_sf_swizzled_layout,
+    bool is_sf_8x4_layout) {
+  TORCH_CHECK(input.device().is_cpu(), "fp4_quantize_cpu: input must be a CPU tensor");
+  TORCH_CHECK(input.is_contiguous(), "fp4_quantize_cpu: input must be contiguous");
+  TORCH_CHECK(input.dim() >= 2, "fp4_quantize_cpu: input must have at least 2 dimensions");
+  TORCH_CHECK(
+      input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf || input.scalar_type() == at::kFloat,
+      "fp4_quantize_cpu: input must be bfloat16, float16, or float32");
+  TORCH_CHECK(sf_vec_size == 16, "fp4_quantize_cpu: only sf_vec_size=16 is supported");
+  TORCH_CHECK(!sf_use_ue8m0, "fp4_quantize_cpu: only E4M3 scale is supported");
+
+  const int64_t cols = input.size(-1);
+  TORCH_CHECK(cols % 16 == 0, "fp4_quantize_cpu: input K dimension must be divisible by 16");
+  const int64_t rows = input.numel() / cols;
+  const int64_t scale_cols = cols / sf_vec_size;
+  const int64_t scale_row_size = is_sf_8x4_layout ? 8 : 128;
+  const int64_t output_scale_rows = is_sf_swizzled_layout ? nvfp4_round_up(rows, scale_row_size) : rows;
+  const int64_t output_scale_cols = is_sf_swizzled_layout ? nvfp4_round_up(scale_cols, 4) : scale_cols;
+
+  auto output_sizes = input.sizes().vec();
+  output_sizes.back() = cols / 2;
+  auto output = at::empty(output_sizes, input.options().dtype(at::kByte));
+  auto scale = at::zeros({output_scale_rows, output_scale_cols}, input.options().dtype(at::kByte));
+
+  float global_scale = 1.0f;
+  if (global_scale_opt.has_value()) {
+    const at::Tensor& scale_tensor = global_scale_opt.value();
+    TORCH_CHECK(scale_tensor.device().is_cpu(), "fp4_quantize_cpu: global_scale must be a CPU tensor");
+    TORCH_CHECK(scale_tensor.numel() == 1, "fp4_quantize_cpu: global_scale must be scalar");
+    global_scale = scale_tensor.item<float>();
+  } else if (input.numel() > 0) {
+    const at::Tensor absmax = input.abs().amax().to(at::kFloat);
+    const float absmax_value = absmax.item<float>();
+    global_scale = absmax_value == 0.0f ? 1.0f : 448.0f * 6.0f / absmax_value;
+  }
+
+  if (rows * scale_cols > 0) {
+    switch (input.scalar_type()) {
+      case at::kFloat:
+        fp4_quantize_cpu_kernel(
+            input.data_ptr<float>(),
+            output.data_ptr<uint8_t>(),
+            scale.data_ptr<uint8_t>(),
+            rows,
+            cols,
+            scale_cols,
+            output_scale_cols,
+            scale_row_size,
+            global_scale,
+            is_sf_swizzled_layout);
+        break;
+      case at::kHalf:
+        fp4_quantize_cpu_kernel(
+            input.data_ptr<at::Half>(),
+            output.data_ptr<uint8_t>(),
+            scale.data_ptr<uint8_t>(),
+            rows,
+            cols,
+            scale_cols,
+            output_scale_cols,
+            scale_row_size,
+            global_scale,
+            is_sf_swizzled_layout);
+        break;
+      case at::kBFloat16:
+        fp4_quantize_cpu_kernel(
+            input.data_ptr<at::BFloat16>(),
+            output.data_ptr<uint8_t>(),
+            scale.data_ptr<uint8_t>(),
+            rows,
+            cols,
+            scale_cols,
+            output_scale_cols,
+            scale_row_size,
+            global_scale,
+            is_sf_swizzled_layout);
+        break;
+      default:
+        TORCH_CHECK(false, "fp4_quantize_cpu: unsupported input dtype");
     }
   }
 

@@ -306,6 +306,15 @@ at::Tensor fp8_scaled_mm_cpu(
 at::Tensor mxfp4_scaled_mm_cpu(
     at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2, const std::optional<at::Tensor>& bias, bool is_vnni);
 
+// fp4 quant
+std::tuple<at::Tensor, at::Tensor> fp4_quantize_cpu(
+    const at::Tensor& input,
+    const std::optional<at::Tensor>& global_scale,
+    int64_t sf_vec_size,
+    bool sf_use_ue8m0,
+    bool is_sf_swizzled_layout,
+    bool is_sf_8x4_layout);
+
 // quant + igemm
 at::Tensor int8_scaled_mm_with_quant(
     at::Tensor& mat1,
@@ -818,6 +827,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // mxfp4 gemm
   m.def("mxfp4_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales2, Tensor? bias, bool is_vnni) -> Tensor");
   m.impl("mxfp4_scaled_mm_cpu", torch::kCPU, &mxfp4_scaled_mm_cpu);
+
+  // fp4 quant
+  m.def(
+      "fp4_quantize_cpu(Tensor input, Tensor? global_scale, int sf_vec_size, bool sf_use_ue8m0, bool "
+      "is_sf_swizzled_layout, bool is_sf_8x4_layout) -> (Tensor, Tensor)");
+  m.impl("fp4_quantize_cpu", torch::kCPU, &fp4_quantize_cpu);
 
   // quant + igemm
   m.def(

@@ -697,6 +697,31 @@ def register_fake_ops(tp_size: int):
         )
         return act_quant, scale
 
+    @torch.library.register_fake("sgl_kernel::fp4_quantize_cpu")
+    def _(
+        input,
+        global_scale,
+        sf_vec_size,
+        sf_use_ue8m0,
+        is_sf_swizzled_layout,
+        is_sf_8x4_layout,
+    ):
+        del global_scale, sf_use_ue8m0
+        m = input.numel() // input.shape[-1]
+        k = input.shape[-1]
+        output_shape = list(input.shape)
+        output_shape[-1] = k // 2
+        act_quant = input.new_empty(output_shape, dtype=torch.uint8)
+        if is_sf_swizzled_layout:
+            row_size = 8 if is_sf_8x4_layout else 128
+            sf_rows = (m + row_size - 1) // row_size * row_size
+            sf_cols = (k // sf_vec_size + 3) // 4 * 4
+        else:
+            sf_rows = m
+            sf_cols = k // sf_vec_size
+        scale = input.new_empty((sf_rows, sf_cols), dtype=torch.uint8)
+        return act_quant, scale
+
     @torch.library.register_fake("sgl_kernel::gguf_mul_mat_cpu")
     def _(x, qweight, qtype, N, K):
         M = x.numel() // K
