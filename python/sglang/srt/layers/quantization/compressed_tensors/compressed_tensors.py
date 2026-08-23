@@ -909,7 +909,12 @@ class CompressedTensorsConfig(QuantizationConfig):
             self._check_scheme_supported(
                 scheme.get_min_capability(),
                 allow_cpu=isinstance(
-                    scheme, (CompressedTensorsW8A8Fp8, CompressedTensorsW8A16Fp8)
+                    scheme,
+                    (
+                        CompressedTensorsW8A8Fp8,
+                        CompressedTensorsW8A16Fp8,
+                        CompressedTensorsW8A8Int8,
+                    ),
                 ),
             )
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)

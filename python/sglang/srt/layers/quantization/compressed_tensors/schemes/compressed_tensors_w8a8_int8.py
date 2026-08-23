@@ -12,6 +12,7 @@ from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
 )
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -21,11 +22,13 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, use_intel_amx_backend
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
@@ -110,17 +113,36 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
                 logical_widths=layer.logical_widths,
             )
 
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            if _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "CompressedTensorsW8A8Int8 on CPU requires AMX support"
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale = Parameter(
+                    max_w_scale.reshape(1).expand(weight.size(0)).contiguous(),
+                    requires_grad=False,
+                )
+                _amx_process_weight_after_loading(layer, ["weight"])
+            else:
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+                layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
 
         # If channelwise, scales are already lined up, so just transpose.
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
             weight_scale = layer.weight_scale.data
 
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            if _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "CompressedTensorsW8A8Int8 on CPU requires AMX support"
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                _amx_process_weight_after_loading(layer, ["weight"])
+            else:
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+                # required by torch.compile to be torch.nn.Parameter
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
@@ -171,6 +193,18 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
+        if _is_cpu:
+            x_2d = x.view(-1, x.shape[-1])
+            output = torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
+                x_2d,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+                use_intel_amx_backend(layer),
+            )
+            return output.view(*x.shape[:-1], layer.weight.shape[0])
+
         # TODO: add cutlass_scaled_mm_azp support
         x_q, x_scale = per_token_quant_int8(x)
 
