@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
     CompressedTensorsW4A4Fp4,
 )
 from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+from sglang.srt.layers.quantization.modelopt_quant import fp4_gemm
 from sglang.test.quant_ref_utils import (
     FLOAT4_E2M1_MAX,
     FLOAT8_E4M3_MAX,
@@ -36,6 +37,7 @@ def _has_cpu_fp4_ops() -> bool:
     return (
         hasattr(torch.ops, "sgl_kernel")
         and hasattr(torch.ops.sgl_kernel, "fp4_quantize_cpu")
+        and hasattr(torch.ops.sgl_kernel, "fp4_gemm_cpu")
         and hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
         and hasattr(torch.ops.sgl_kernel, "weight_packed_linear")
     )
@@ -66,6 +68,38 @@ class TestCompressedTensorsW4A4Fp4CPU(CustomTestCase):
         )
         rel_err = ((x_dequant - x.float()).norm() / x.float().norm()).item()
         self.assertLess(rel_err, 0.18)
+
+    @unittest.skipUnless(_has_cpu_fp4_ops(), "requires sgl_kernel CPU FP4 ops")
+    def test_fp4_gemm_cpu_matches_dequant_reference(self):
+        torch.manual_seed(2)
+        m, n, k = 9, 64, 128
+        x = torch.randn(m, k, dtype=torch.bfloat16) * 0.1
+        weight = torch.randn(n, k, dtype=torch.bfloat16) * 0.1
+        input_global_scale = _global_scale(x)
+        weight_global_scale = _global_scale(weight)
+        x_fp4, x_scale = fp4_quantize(x, input_global_scale)
+        weight_fp4, weight_scale = fp4_quantize(weight, weight_global_scale)
+        alpha = 1 / (input_global_scale * weight_global_scale)
+
+        out = fp4_gemm(
+            x_fp4,
+            weight_fp4,
+            x_scale,
+            weight_scale,
+            alpha,
+            torch.bfloat16,
+            n,
+        )
+
+        x_dequant = dequantize_nvfp4_to_dtype(
+            x_fp4, x_scale, input_global_scale, torch.float32
+        )
+        weight_dequant = dequantize_nvfp4_to_dtype(
+            weight_fp4, weight_scale, weight_global_scale, torch.float32
+        )
+        ref = (x_dequant @ weight_dequant.T).to(torch.bfloat16)
+        rel_err = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
+        self.assertLess(rel_err, 0.05)
 
     @unittest.skipUnless(_has_cpu_fp4_ops(), "requires sgl_kernel CPU FP4 ops")
     def test_apply_weights_cpu_uses_fp4_quantize(self):

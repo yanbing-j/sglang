@@ -722,6 +722,11 @@ def register_fake_ops(tp_size: int):
         scale = input.new_empty((sf_rows, sf_cols), dtype=torch.uint8)
         return act_quant, scale
 
+    @torch.library.register_fake("sgl_kernel::fp4_gemm_cpu")
+    def _(input, weight, input_sf, weight_sf, alpha, out_dtype, out_features):
+        del weight, input_sf, weight_sf, alpha
+        return input.new_empty((input.shape[0], out_features), dtype=out_dtype)
+
     @torch.library.register_fake("sgl_kernel::gguf_mul_mat_cpu")
     def _(x, qweight, qtype, N, K):
         M = x.numel() // K

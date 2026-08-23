@@ -7,6 +7,9 @@
 #include "gemm.h"
 #include "vec.h"
 
+at::Tensor
+weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
+
 namespace {
 
 template <typename scalar_t>
@@ -1511,6 +1514,28 @@ inline float fp8e4m3_byte_to_float(uint8_t value) {
   return static_cast<float>(scale);
 }
 
+inline float fp4_e2m1_value(uint8_t code) {
+  static constexpr float values[16] = {
+      0.0f,
+      0.5f,
+      1.0f,
+      1.5f,
+      2.0f,
+      3.0f,
+      4.0f,
+      6.0f,
+      -0.0f,
+      -0.5f,
+      -1.0f,
+      -1.5f,
+      -2.0f,
+      -3.0f,
+      -4.0f,
+      -6.0f,
+  };
+  return values[code & 0xF];
+}
+
 inline int64_t nvfp4_round_up(int64_t x, int64_t y) {
   return ((x + y - 1) / y) * y;
 }
@@ -1688,6 +1713,123 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_cpu(
   }
 
   return std::make_tuple(output, scale);
+}
+
+template <typename scalar_t>
+void dequantize_nvfp4_cpu_kernel(
+    const uint8_t* __restrict__ input_data,
+    const uint8_t* __restrict__ scale_data,
+    scalar_t* __restrict__ output_data,
+    int64_t rows,
+    int64_t cols,
+    int64_t scale_cols,
+    int64_t swizzled_scale_cols,
+    float scale_multiplier) {
+  constexpr int64_t group_size = 16;
+  constexpr int64_t packed_group_size = group_size / 2;
+  constexpr int64_t scale_row_size = 128;
+
+  at::parallel_for(0, rows * scale_cols, 0, [&](int64_t begin, int64_t end) {
+    alignas(64) float values[group_size];
+    for (int64_t group_index = begin; group_index < end; ++group_index) {
+      const int64_t row = group_index / scale_cols;
+      const int64_t scale_col = group_index % scale_cols;
+      const int64_t scale_offset = nvfp4_swizzled_scale_offset(row, scale_col, swizzled_scale_cols, scale_row_size);
+      const float scale = fp8e4m3_byte_to_float(scale_data[scale_offset]) * scale_multiplier;
+
+      const uint8_t* input_group = input_data + row * (cols / 2) + scale_col * packed_group_size;
+      for (int64_t i = 0; i < packed_group_size; ++i) {
+        const uint8_t packed_value = input_group[i];
+        values[i * 2] = fp4_e2m1_value(packed_value & 0xF) * scale;
+        values[i * 2 + 1] = fp4_e2m1_value(packed_value >> 4) * scale;
+      }
+
+      __m512 value_vec = _mm512_load_ps(values);
+      scalar_t* output_group = output_data + row * cols + scale_col * group_size;
+      if constexpr (std::is_same_v<scalar_t, float>) {
+        _mm512_storeu_ps(output_group, value_vec);
+      } else if constexpr (std::is_same_v<scalar_t, at::BFloat16>) {
+        __m256bh bf16_vec = _mm512_cvtneps_pbh(value_vec);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(output_group), (__m256i)bf16_vec);
+      } else {
+        __m256i fp16_vec = _mm512_cvtps_ph(value_vec, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(output_group), fp16_vec);
+      }
+    }
+  });
+}
+
+template <typename scalar_t>
+at::Tensor dequantize_nvfp4_cpu(
+    const at::Tensor& input,
+    const at::Tensor& scale,
+    int64_t logical_rows,
+    int64_t logical_cols,
+    float scale_multiplier,
+    at::ScalarType out_dtype) {
+  const int64_t scale_cols = logical_cols / 16;
+  const int64_t swizzled_scale_cols = nvfp4_round_up(scale_cols, 4);
+  auto output = at::empty({logical_rows, logical_cols}, input.options().dtype(out_dtype));
+  const uint8_t* scale_data = scale.scalar_type() == at::kByte
+                                  ? scale.data_ptr<uint8_t>()
+                                  : reinterpret_cast<const uint8_t*>(scale.data_ptr<at::Float8_e4m3fn>());
+  dequantize_nvfp4_cpu_kernel<scalar_t>(
+      input.data_ptr<uint8_t>(),
+      scale_data,
+      output.data_ptr<scalar_t>(),
+      logical_rows,
+      logical_cols,
+      scale_cols,
+      swizzled_scale_cols,
+      scale_multiplier);
+  return output;
+}
+
+at::Tensor fp4_gemm_cpu(
+    at::Tensor& input,
+    at::Tensor& weight,
+    at::Tensor& input_sf,
+    at::Tensor& weight_sf,
+    at::Tensor& alpha,
+    at::ScalarType out_dtype,
+    int64_t out_features) {
+  CHECK_INPUT(input);
+  CHECK_INPUT(weight);
+  CHECK_INPUT(input_sf);
+  CHECK_INPUT(weight_sf);
+  CHECK_INPUT(alpha);
+  TORCH_CHECK(input.scalar_type() == at::kByte, "fp4_gemm_cpu: input must be uint8 packed FP4");
+  TORCH_CHECK(weight.scalar_type() == at::kByte, "fp4_gemm_cpu: weight must be uint8 packed FP4");
+  TORCH_CHECK(
+      input_sf.scalar_type() == at::kByte || input_sf.scalar_type() == at::kFloat8_e4m3fn,
+      "fp4_gemm_cpu: input_sf must be uint8 or float8_e4m3fn E4M3 scale bytes");
+  TORCH_CHECK(
+      weight_sf.scalar_type() == at::kByte || weight_sf.scalar_type() == at::kFloat8_e4m3fn,
+      "fp4_gemm_cpu: weight_sf must be uint8 or float8_e4m3fn E4M3 scale bytes");
+  TORCH_CHECK(alpha.numel() == 1, "fp4_gemm_cpu: alpha must be scalar");
+  TORCH_CHECK(
+      out_dtype == at::kBFloat16 || out_dtype == at::kHalf, "fp4_gemm_cpu: out_dtype must be bfloat16 or float16");
+  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2, "fp4_gemm_cpu: input and weight must be 2D");
+
+  const int64_t M = input.size(0);
+  const int64_t packed_K = input.size(1);
+  const int64_t K = packed_K * 2;
+  TORCH_CHECK(weight.size(0) == out_features, "fp4_gemm_cpu: weight must be row-major [N, K / 2]");
+  TORCH_CHECK(weight.size(1) == packed_K, "fp4_gemm_cpu: input and weight K dimensions must match");
+
+  const float alpha_value = alpha.item<float>();
+  at::Tensor dequant_input;
+  at::Tensor dequant_weight;
+  if (out_dtype == at::kBFloat16) {
+    dequant_input = dequantize_nvfp4_cpu<at::BFloat16>(input, input_sf, M, K, 1.0f, out_dtype);
+    dequant_weight = dequantize_nvfp4_cpu<at::BFloat16>(weight, weight_sf, out_features, K, alpha_value, out_dtype);
+  } else {
+    dequant_input = dequantize_nvfp4_cpu<at::Half>(input, input_sf, M, K, 1.0f, out_dtype);
+    dequant_weight = dequantize_nvfp4_cpu<at::Half>(weight, weight_sf, out_features, K, alpha_value, out_dtype);
+  }
+
+  auto packed_weight = convert_weight_packed(dequant_weight);
+  return weight_packed_linear(dequant_input, packed_weight, std::nullopt, true);
 }
 // tinygemm interface
 template <typename scalar_t>

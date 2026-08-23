@@ -314,6 +314,14 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_cpu(
     bool sf_use_ue8m0,
     bool is_sf_swizzled_layout,
     bool is_sf_8x4_layout);
+at::Tensor fp4_gemm_cpu(
+    at::Tensor& input,
+    at::Tensor& weight,
+    at::Tensor& input_sf,
+    at::Tensor& weight_sf,
+    at::Tensor& alpha,
+    at::ScalarType out_dtype,
+    int64_t out_features);
 
 // quant + igemm
 at::Tensor int8_scaled_mm_with_quant(
@@ -833,6 +841,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp4_quantize_cpu(Tensor input, Tensor? global_scale, int sf_vec_size, bool sf_use_ue8m0, bool "
       "is_sf_swizzled_layout, bool is_sf_8x4_layout) -> (Tensor, Tensor)");
   m.impl("fp4_quantize_cpu", torch::kCPU, &fp4_quantize_cpu);
+
+  // fp4 gemm
+  m.def(
+      "fp4_gemm_cpu(Tensor input, Tensor weight, Tensor input_sf, Tensor weight_sf, Tensor alpha, ScalarType "
+      "out_dtype, int out_features) -> Tensor");
+  m.impl("fp4_gemm_cpu", torch::kCPU, &fp4_gemm_cpu);
 
   // quant + igemm
   m.def(

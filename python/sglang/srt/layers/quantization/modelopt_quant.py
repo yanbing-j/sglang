@@ -128,8 +128,8 @@ def _sglang_fp4_gemm_fake(
     return input.new_empty((M, N), dtype=out_dtype)
 
 
-@register_custom_op(fake_impl=_sglang_fp4_gemm_fake)
-def fp4_gemm(
+@register_custom_op(op_name="fp4_gemm", fake_impl=_sglang_fp4_gemm_fake)
+def _fp4_gemm_cuda(
     input: torch.Tensor,
     weight: torch.Tensor,
     input_sf: torch.Tensor,
@@ -147,6 +147,36 @@ def fp4_gemm(
     backend = fp4_backend.get_flashinfer_backend()
     return flashinfer_fp4_gemm(
         input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+    )
+
+
+def fp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    if input.device.type == "cpu":
+        return torch.ops.sgl_kernel.fp4_gemm_cpu(
+            input,
+            weight,
+            input_sf,
+            weight_sf,
+            alpha,
+            out_dtype,
+            out_features,
+        )
+    return _fp4_gemm_cuda(
+        input,
+        weight,
+        input_sf,
+        weight_sf,
+        alpha,
+        out_dtype,
+        out_features,
     )
 
 
