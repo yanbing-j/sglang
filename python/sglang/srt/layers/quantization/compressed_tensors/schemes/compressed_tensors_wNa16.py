@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     check_marlin_supports_shape,
     marlin_is_k_full,
     marlin_make_empty_g_idx,
+    marlin_make_empty_zp,
     marlin_make_workspace,
     marlin_permute_scales,
     marlin_repeat_scales_on_all_ranks,
@@ -39,9 +40,11 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
@@ -58,6 +61,37 @@ WNA16_SUPPORTED_TYPES_MAP = {
 }
 WNA16_ZP_SUPPORTED_TYPES_MAP = {4: scalar_types.uint4, 8: scalar_types.uint8}
 WNA16_SUPPORTED_BITS = list(WNA16_SUPPORTED_TYPES_MAP.keys())
+
+
+def _dequantize_wna16_weight_for_cpu(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_zero_point: Optional[torch.Tensor],
+    config: MarlinLinearLayerConfig,
+) -> torch.Tensor:
+    size_k, size_n = config.partition_weight_shape
+    num_bits = config.weight_type.size_bits
+    group_size = config.group_size if config.group_size != -1 else size_k
+    groups = size_k // group_size
+
+    qweight = unpack_cols(weight.contiguous(), num_bits, size_n, size_k).to(
+        torch.float32
+    )
+    scales = weight_scale.to(torch.float32)
+    if scales.dim() == 1:
+        scales = scales.view(size_n, 1)
+
+    group_idx = torch.arange(size_k, device=weight.device) // group_size
+    if config.zero_points:
+        assert weight_zero_point is not None
+        qzeros = unpack_cols(
+            weight_zero_point.t().contiguous(), num_bits, groups, size_n
+        ).t()
+        qweight = qweight - qzeros[:, group_idx].to(torch.float32)
+    elif config.weight_type.has_bias():
+        qweight = qweight - config.weight_type.bias
+
+    return (qweight * scales[:, group_idx]).to(config.act_type)
 
 
 class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
@@ -227,6 +261,29 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
+
+        if _is_cpu:
+            assert _is_cpu_amx_available, "CompressedTensorsWNA16 on CPU requires AMX support"
+            if c.has_g_idx:
+                raise NotImplementedError(
+                    "CompressedTensorsWNA16 on CPU does not support activation-order GPTQ."
+                )
+            setattr(layer, self.w_gidx_name, marlin_make_empty_g_idx(device))
+            layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
+            if not c.zero_points:
+                setattr(layer, self.w_zp_name, marlin_make_empty_zp(device))
+            self.workspace = torch.empty(0, dtype=torch.int, device=device)
+
+            weight_zp = layer.weight_zero_point if c.zero_points else None
+            weight = _dequantize_wna16_weight_for_cpu(
+                layer.weight_packed, layer.weight_scale, weight_zp, c
+            )
+            layer.weight_packed = torch.nn.Parameter(
+                torch.ops.sgl_kernel.convert_weight_packed(weight.contiguous()),
+                requires_grad=False,
+            )
+            layer.use_intel_amx_backend = True
+            return
 
         # Allocate marlin workspace.
         self.workspace = marlin_make_workspace(device)

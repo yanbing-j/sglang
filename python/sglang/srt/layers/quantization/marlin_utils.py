@@ -503,6 +503,15 @@ def apply_gptq_marlin_linear(
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (output_size_per_partition,)
 
+    if input.device.type == "cpu":
+        output = torch.ops.sgl_kernel.weight_packed_linear(
+            reshaped_x.contiguous(),
+            weight,
+            bias,
+            True,
+        )
+        return output.reshape(out_shape)
+
     use_atomic_add = should_use_atomic_add_reduce(
         m=reshaped_x.size(0),
         n=output_size_per_partition,

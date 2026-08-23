@@ -914,6 +914,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                         CompressedTensorsW8A8Fp8,
                         CompressedTensorsW8A16Fp8,
                         CompressedTensorsW8A8Int8,
+                        CompressedTensorsWNA16,
                     ),
                 ),
             )
