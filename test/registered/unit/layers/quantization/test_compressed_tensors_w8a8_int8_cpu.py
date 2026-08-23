@@ -14,6 +14,7 @@ from compressed_tensors.quantization import (
     QuantizationType,
 )
 
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.compressed_tensors import (
     compressed_tensors as ct_config_module,
 )
@@ -30,8 +31,10 @@ from sglang.test.test_utils import CustomTestCase
 
 
 def _has_cpu_int8_ops() -> bool:
-    return hasattr(torch.ops, "sgl_kernel") and hasattr(
-        torch.ops.sgl_kernel, "int8_scaled_mm_with_quant"
+    return (
+        hasattr(torch.ops, "sgl_kernel")
+        and hasattr(torch.ops.sgl_kernel, "per_token_quant_int8_cpu")
+        and hasattr(torch.ops.sgl_kernel, "int8_scaled_mm_cpu")
     )
 
 
@@ -53,7 +56,23 @@ def _make_tensor_scheme() -> CompressedTensorsW8A8Int8:
 
 class TestCompressedTensorsW8A8Int8CPU(CustomTestCase):
     @unittest.skipUnless(_has_cpu_int8_ops(), "requires sgl_kernel CPU INT8 ops")
-    def test_channel_weight_uses_cpu_int8_scaled_mm_with_quant(self):
+    def test_per_token_quant_int8_uses_cpu_kernel(self):
+        torch.manual_seed(0)
+        x = torch.randn(2, 3, 128, dtype=torch.bfloat16) / 10
+
+        x_q, x_scale = per_token_quant_int8(x)
+        ref_q, ref_scale = torch.ops.sgl_kernel.per_token_quant_int8_cpu(
+            x.view(-1, x.shape[-1])
+        )
+
+        self.assertEqual(x_q.dtype, torch.uint8)
+        self.assertEqual(x_q.shape, x.shape)
+        self.assertEqual(x_scale.shape, (*x.shape[:-1], 1))
+        torch.testing.assert_close(x_q.view(-1, x.shape[-1]), ref_q)
+        torch.testing.assert_close(x_scale.view(-1), ref_scale)
+
+    @unittest.skipUnless(_has_cpu_int8_ops(), "requires sgl_kernel CPU INT8 ops")
+    def test_channel_weight_uses_cpu_per_token_quant_int8_and_scaled_mm(self):
         torch.manual_seed(0)
         n, k = 64, 128
         x = torch.randn(2, 3, k, dtype=torch.bfloat16) / 10
@@ -80,7 +99,7 @@ class TestCompressedTensorsW8A8Int8CPU(CustomTestCase):
         self.assertEqual(layer.weight.shape, (n, k + 4))
 
         x_2d = x.view(-1, k)
-        x_q, x_scale = torch.ops.sgl_kernel.per_token_quant_int8_cpu(x_2d)
+        x_q, x_scale = per_token_quant_int8(x_2d)
         ref = torch.ops.sgl_kernel.int8_scaled_mm_cpu(
             x_q,
             layer.weight,
@@ -94,7 +113,7 @@ class TestCompressedTensorsW8A8Int8CPU(CustomTestCase):
         torch.testing.assert_close(out, ref)
 
     @unittest.skipUnless(_has_cpu_int8_ops(), "requires sgl_kernel CPU INT8 ops")
-    def test_tensor_weight_uses_cpu_int8_scaled_mm_with_quant(self):
+    def test_tensor_weight_uses_cpu_per_token_quant_int8_and_scaled_mm(self):
         torch.manual_seed(1)
         n, k = 64, 128
         x = torch.randn(4, k, dtype=torch.bfloat16) / 10
@@ -127,7 +146,7 @@ class TestCompressedTensorsW8A8Int8CPU(CustomTestCase):
         self.assertEqual(layer.weight_scale.numel(), n)
         self.assertEqual(layer.input_scale.numel(), 1)
 
-        x_q, x_scale = torch.ops.sgl_kernel.per_token_quant_int8_cpu(x)
+        x_q, x_scale = per_token_quant_int8(x)
         ref = torch.ops.sgl_kernel.int8_scaled_mm_cpu(
             x_q,
             layer.weight,

@@ -195,9 +195,11 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     ) -> torch.Tensor:
         if _is_cpu:
             x_2d = x.view(-1, x.shape[-1])
-            output = torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
-                x_2d,
+            x_q, x_scale = per_token_quant_int8(x_2d)
+            output = torch.ops.sgl_kernel.int8_scaled_mm_cpu(
+                x_q,
                 layer.weight,
+                x_scale,
                 layer.weight_scale,
                 bias,
                 x.dtype,
