@@ -1,10 +1,13 @@
+import importlib
 import unittest
+from unittest.mock import patch
 
 # TODO: use interface in cpu.py
 import sgl_kernel  # noqa: F401
 import torch
 import torch.nn as nn
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import (
     MXFP4QuantizeUtil,
@@ -238,6 +241,77 @@ class TestGemm(CustomTestCase):
         atol = rtol = 2e-2
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(ref, fused_out, atol=atol, rtol=rtol)
+
+    def test_fp8_linear_method_uses_cpu_brgemm_path(self):
+        import sglang.srt.layers.quantization.fp8 as fp8_module
+
+        data = torch.randn(2, 512, dtype=torch.bfloat16)
+        expected = torch.randn(2, 128, dtype=torch.bfloat16)
+
+        def prepack(weight, weight_scale):
+            return weight, weight_scale
+
+        def fp8_linear(
+            input, input_scale, channelwise, weight, weight_scale, bias, output_dtype
+        ):
+            self.assertIs(input, data)
+            self.assertFalse(channelwise)
+            self.assertIsNone(bias)
+            self.assertEqual(output_dtype, data.dtype)
+            return expected
+
+        with (
+            envs.SGLANG_LLAMA_BRGEMM_FP8A8.override(True),
+            envs.SGLANG_BRGEMM_REF_FP8A8.override(False),
+            envs.SGLANG_DEEPSEEK_FP8A8.override(False),
+        ):
+            fp8_module = importlib.reload(fp8_module)
+            try:
+                quant_config = fp8_module.Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    activation_scheme="static",
+                )
+                layer = nn.Module()
+                layer.logical_widths = [128]
+                layer.weight = nn.Parameter(
+                    torch.randn(128, 512).to(torch.float8_e4m3fn), requires_grad=False
+                )
+                layer.weight_scale = nn.Parameter(
+                    torch.ones(128, dtype=torch.float32), requires_grad=False
+                )
+                layer.input_scale = nn.Parameter(
+                    torch.tensor([1.0], dtype=torch.float32), requires_grad=False
+                )
+
+                with (
+                    patch.object(fp8_module, "_is_cpu_amx_available", True),
+                    patch.object(
+                        fp8_module,
+                        "dispatch_w8a8_block_fp8_linear",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        torch.ops.sgl_kernel,
+                        "float8_linear_prepack_cpu",
+                        side_effect=prepack,
+                        create=True,
+                    ) as prepack_mock,
+                    patch.object(
+                        torch.ops.sgl_kernel,
+                        "fp8_scaled_mm_with_quant",
+                        side_effect=fp8_linear,
+                        create=True,
+                    ) as fp8_linear_mock,
+                ):
+                    method = fp8_module.Fp8LinearMethod(quant_config)
+                    method.process_weights_after_loading(layer)
+                    out = method.apply(layer, data)
+
+                self.assertIs(out, expected)
+                prepack_mock.assert_called_once()
+                fp8_linear_mock.assert_called_once()
+            finally:
+                importlib.reload(fp8_module)
 
     @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
     def test_mxfp4_gemm(self, M, N, K, has_bias):
