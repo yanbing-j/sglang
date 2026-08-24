@@ -185,6 +185,60 @@ class TestGemm(CustomTestCase):
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
+    @parametrize(M=[1, 11], N=[128, 224], K=[512], has_bias=[False, True])
+    def test_float8_linear_cpu(self, M, N, K, has_bias):
+        dtype = torch.bfloat16
+        group_size = 128
+        data = torch.randn(M, K, dtype=dtype) / 10
+        weight = torch.randn(N, K, dtype=dtype) / 10
+        bias = torch.randn(N, dtype=torch.float32) if has_bias else None
+
+        weight_groups = weight.float().view(N, K // group_size, group_size)
+        weight_scales = weight_groups.abs().amax(dim=-1).clamp_min(1e-10) / 448.0
+        weight_fp8 = (weight_groups / weight_scales.unsqueeze(-1)).to(
+            torch.float8_e4m3fn
+        )
+        weight_fp8 = weight_fp8.view(N, K)
+        dequant_weight = (
+            weight_fp8.float().view(N, K // group_size, group_size)
+            * weight_scales.unsqueeze(-1)
+        ).view(N, K)
+
+        input_fp8, input_scales = torch.ops.sgl_kernel._quantize_fp8e4m3_vec(
+            data, True, None
+        )
+        dequant_input = input_fp8.float() * input_scales.view(-1, 1)
+        packed_weight, packed_scales = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+            weight_fp8, weight_scales
+        )
+
+        out = torch.ops.sgl_kernel.float8_linear_cpu(
+            input_fp8,
+            input_scales,
+            packed_weight,
+            packed_scales,
+            bias,
+            dtype,
+        )
+        fused_out = torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+            data,
+            None,
+            True,
+            packed_weight,
+            packed_scales,
+            bias,
+            dtype,
+        )
+
+        ref = torch.matmul(dequant_input, dequant_weight.t())
+        if has_bias:
+            ref.add_(bias)
+        ref = ref.to(dtype)
+
+        atol = rtol = 2e-2
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(ref, fused_out, atol=atol, rtol=rtol)
+
     @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
     def test_mxfp4_gemm(self, M, N, K, has_bias):
         prepack = True
