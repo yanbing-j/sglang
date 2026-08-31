@@ -109,15 +109,16 @@ class PhaseConfig:
 
 def default_prefill_backend() -> str:
     """BCG (breakable) is the prefill default on CUDA only; other platforms
-    (HIP/NPU/...) keep tc_piecewise until BCG is validated there. CPU graph
-    capture uses the CPU-specific full backend. Lazy import keeps this module's
-    stdlib-only import invariant (see module docstring)."""
+    (HIP/NPU/...) keep tc_piecewise until BCG is validated there. CPU prefill
+    graph capture is opt-in because the full backend is experimental. Lazy
+    import keeps this module's stdlib-only import invariant (see module
+    docstring)."""
     from sglang.srt.utils import is_cpu, is_cuda
 
     if is_cuda():
         return Backend.BREAKABLE
     if is_cpu():
-        return Backend.FULL
+        return Backend.DISABLED
     return Backend.TC_PIECEWISE
 
 
