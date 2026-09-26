@@ -25,6 +25,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (
     CompressedTensorsW8A16Fp8,
 )
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+    CompressedTensorsWNA16,
+)
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
 from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
 from sglang.srt.layers.quantization.gptq.gptq import GPTQMarlinConfig
