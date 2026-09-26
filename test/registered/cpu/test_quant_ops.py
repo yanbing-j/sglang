@@ -9,6 +9,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     scaled_fp8_quant,
     static_quant_fp8,
 )
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
 from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -142,6 +143,18 @@ class TestCPUQuantOps(CustomTestCase):
         out = fused_mul_mat_gguf(x, qweight, GGMLQuantizationType.Q4_0)
 
         torch.testing.assert_close(out, x @ weight.T, atol=0.3, rtol=0.3)
+
+    def test_per_token_quant_int8_python_dispatch_cpu(self):
+        x = torch.randn(4, 33, dtype=torch.bfloat16)
+
+        x_q, scales, x_sum = per_token_quant_int8(x, cal_sum=True)
+        ref_q, ref_scales = torch.ops.sgl_kernel.per_token_quant_int8_cpu(
+            x.contiguous()
+        )
+
+        torch.testing.assert_close(x_q, ref_q)
+        torch.testing.assert_close(scales, ref_scales)
+        torch.testing.assert_close(x_sum, x.sum(dim=-1))
 
 
 if __name__ == "__main__":
