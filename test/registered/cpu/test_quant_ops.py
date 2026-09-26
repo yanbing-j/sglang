@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import sgl_kernel  # noqa: F401
 import torch
-from compressed_tensors.quantization import QuantizationStrategy
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from gguf import GGMLQuantizationType
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -16,8 +16,14 @@ from sglang.srt.layers.quantization.awq.awq import AWQMarlinConfig
 from sglang.srt.layers.quantization.awq.schemes.awq_cpu import (
     AWQIntelAMXLinearScheme,
 )
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
+    CompressedTensorsW8A8Fp8,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
     CompressedTensorsW8A8Int8,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (
+    CompressedTensorsW8A16Fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
 from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
@@ -239,10 +245,10 @@ class TestCPUQuantOps(CustomTestCase):
             )
 
     def test_compressed_tensors_w8a16_fp8_cpu(self):
-        x = torch.randn(3, 64, dtype=torch.bfloat16)
-        weight = (torch.randn(5, 64) / 4).to(torch.float8_e4m3fn)
-        weight_scale = torch.tensor(0.02, dtype=torch.float32)
-        bias = torch.randn(5, dtype=torch.float32) / 10
+        x = torch.randn(5, 64, dtype=torch.bfloat16)
+        weight = (torch.randn(32, 64) / 4).to(torch.float8_e4m3fn)
+        weight_scale = torch.tensor([0.02], dtype=torch.float32)
+        bias = torch.randn(32, dtype=torch.float32) / 10
         layer = SimpleNamespace(weight=weight, weight_scale=weight_scale)
         scheme = CompressedTensorsW8A16Fp8(QuantizationStrategy.TENSOR, False)
 
@@ -294,6 +300,7 @@ class TestCPUQuantOps(CustomTestCase):
         )
 
         torch.testing.assert_close(out, ref)
+
 
 if __name__ == "__main__":
     unittest.main()
