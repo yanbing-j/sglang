@@ -334,6 +334,7 @@ std::tuple<at::Tensor, at::Tensor> scaled_fp8_quant_cpu(
     int64_t num_token_padding,
     bool use_per_token_if_dynamic);
 std::tuple<at::Tensor, at::Tensor> mxfp8_group_quantize_cpu(const at::Tensor& input);
+at::Tensor gguf_mul_mat_cpu(const at::Tensor& x, const at::Tensor& qweight, int64_t qtype);
 
 // igemm
 at::Tensor int8_scaled_mm_cpu(
@@ -852,6 +853,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("scaled_fp8_quant_cpu", torch::kCPU, &scaled_fp8_quant_cpu);
   m.def("mxfp8_group_quantize_cpu(Tensor input) -> (Tensor, Tensor)");
   m.impl("mxfp8_group_quantize_cpu", torch::kCPU, &mxfp8_group_quantize_cpu);
+  m.def("gguf_mul_mat_cpu(Tensor x, Tensor qweight, int qtype) -> Tensor");
+  m.impl("gguf_mul_mat_cpu", torch::kCPU, &gguf_mul_mat_cpu);
 
   // igemm
   m.def(
