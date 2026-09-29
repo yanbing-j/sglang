@@ -188,7 +188,6 @@ def register_fake_ops(tp_size: int):
     for op in [
         "rmsnorm_cpu",
         "l2norm_cpu",
-        "fused_experts_cpu",
         "fused_rmsnorm_gated_cpu",
         "shared_expert_cpu",
         "causal_conv1d_update_cpu",
@@ -218,6 +217,32 @@ def register_fake_ops(tp_size: int):
     def _(data, dim):
         return torch.cat([data] * tp_size, dim=dim)
 
+    @torch.library.register_fake(f"sgl_kernel::fused_experts_cpu")
+    def _(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        inplace,
+        moe_comp_method,
+        w1_scale,
+        w2_scale,
+        w1_zero,
+        w2_zero,
+        a1_scale,
+        block_size,
+        w1_bias,
+        w2_bias,
+        alpha,
+        limit,
+        is_vnni,
+        activation=None,
+    ):
+        if inplace:
+            return hidden_states
+        return torch.empty_like(hidden_states, dtype=torch.bfloat16)
+
     @register_cpu_compile_fake("qkv_proj_with_rope")
     def _(
         hidden_states,
@@ -235,6 +260,7 @@ def register_fake_ops(tp_size: int):
         q_a_proj_scale,
         q_b_proj_scale,
         kv_a_proj_scale,
+        w_scale,
         is_vnni,
         block_size,
     ):
@@ -594,7 +620,7 @@ def register_fake_ops(tp_size: int):
         input_scales,
     ):
         M = input.shape[0]
-        K = input.shape[0]
+        K = input.shape[1]
         act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
         scale = input.new_empty(M, dtype=torch.float) if channelwise else input.new_empty(1, dtype=torch.float)
         return act_quant, scale
@@ -606,7 +632,7 @@ def register_fake_ops(tp_size: int):
         input_scales,
     ):
         M = input.shape[0]
-        K = input.shape[0]
+        K = input.shape[1]
         act_quant = input.new_empty(M, K, dtype=torch.float8_e4m3fn)
         scale = input.new_empty(M, dtype=torch.float) if channelwise else input.new_empty(1, dtype=torch.float)
         return act_quant, scale

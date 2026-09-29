@@ -303,14 +303,13 @@ void _float8_linear_impl(
   // weight shape = [Nc, Kc, block_k, block_n]
   // scales shape = [Nc, G, block_n]
   int64_t Nc = weight.size(0);
-  int64_t Kc = wei_quant_mode == PER_TENSOR ? 1 : weight.size(1);
-  int64_t block_k = wei_quant_mode == PER_TENSOR ? weight.size(1) * weight.size(2) : weight.size(2);
+  int64_t Kc = wei_quant_mode != PER_GROUP ? 1 : weight.size(1);
+  int64_t block_k = wei_quant_mode != PER_GROUP ? weight.size(1) * weight.size(2) : weight.size(2);
   constexpr int64_t block_n = BLOCK_N;
   TORCH_CHECK(weight.size(3) == block_n, "Float8 linear: unexpected weight shape");
   int64_t N = Nc * block_n;
   TORCH_CHECK(K == Kc * block_k, "Float8 linear: weight and input shapes mismatch");
   auto [parallel_on_M, block_m, Mc, Mc_parallel] = get_m_blocking(M);
-  int64_t num_parallel_blocks = Mc_parallel * Nc;
 
   // scales shape = [Nc, G, block_n]
   int64_t num_groups = wei_quant_mode == PER_TENSOR ? 1 : weight_scales.size(1);
@@ -344,13 +343,13 @@ void _float8_linear_impl(
   at::Tensor micro_gemm_buffer = at::empty({num_thread, buffer_size}, output.options().dtype(at::kBFloat16));
 #endif
 
-  at::parallel_for(0, num_parallel_blocks, 1, [&](int64_t begin, int64_t end) {
-    // Get the address of pre-allocated buffers
-    float* y_buf = y_buffer.data_ptr<float>() + at::get_thread_num() * block_size;
+  parallel_2d(Mc, Nc, [&](int64_t mc0, int64_t mc1, int64_t nc0, int64_t nc1) {
+    int tid = get_thread_num();
+    float* y_buf = y_buffer.data_ptr<float>() + tid * block_size;
     at::BFloat16 *dqA_buffer = nullptr, *dqB_buffer = nullptr;
     float* ukernel_buf = nullptr;
 #if defined(CPU_CAPABILITY_AVX512)
-    at::BFloat16* micro_gemm_buf = micro_gemm_buffer.data_ptr<at::BFloat16>() + at::get_thread_num() * buffer_size;
+    at::BFloat16* micro_gemm_buf = micro_gemm_buffer.data_ptr<at::BFloat16>() + tid * buffer_size;
     ukernel_buf = reinterpret_cast<float*>(micro_gemm_buf);
 #ifndef CPUBLAS_BRGEMM_F8F8F32
     dqA_buffer = micro_gemm_buf;
@@ -358,46 +357,39 @@ void _float8_linear_impl(
     ukernel_buf = reinterpret_cast<float*>(micro_gemm_buf + block_m * block_k + block_k * block_n);
 #endif
 #endif
-    int64_t mc = 0, nc = 0;
-    data_index_init(begin, mc, Mc_parallel, nc, Nc);
-    for (const auto i : c10::irange(begin, end)) {
-      (void)i;  // Suppress unused variable
-      int64_t mc_end = parallel_on_M ? mc + 1 : Mc;
 
-      for (int mci = mc; mci < mc_end; ++mci) {
-        int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
-        zero_buffer(y_buf, m_size * block_n);
-        for (int kci = 0; kci < Kc; ++kci) {
-          auto scales_a = a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
-          auto scales_b = b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n;
-          _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
-              /* C */ y_buf,
-              /* A */ a_ptr + mci * block_m * K + kci * block_k,
-              /* scales_a */ scales_a,
-              /* B */ b_ptr + (nc * Kc + kci) * block_n * block_k,
-              /* scales_b */ scales_b,
-              /* M */ m_size,
-              /* K */ block_k,
-              /* lda */ K,
-              /* ldc */ block_n,
-              /* ldsa */ ldsa,
-              /* ukernel_buf */ ukernel_buf,
-              /* dqA_buf */ dqA_buffer,
-              /* dqB_buf */ dqB_buffer);
-        }
-        // store y_buf to output with dtype conversion
-        auto scales_a = act_quant_mode == PER_TENSOR ? a_scales_ptr
-                        : act_quant_mode == PER_ROW  ? a_scales_ptr + mci * block_m
-                                                     : nullptr;
-        auto scales_b = wei_quant_mode == PER_TENSOR ? b_scales_ptr
-                        : wei_quant_mode == PER_ROW  ? b_scales_ptr + nc * block_n
-                                                     : nullptr;
-        auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
-        store_out<out_dtype, block_n, act_quant_mode, wei_quant_mode>(
-            y_buf, c_ptr + mci * block_m * N + nc * block_n, m_size, N /*lda*/, scales_a, scales_b, bias_data);
+    loop_2d<at::Float8_e4m3fn>(mc0, mc1, nc0, nc1, block_n * K, [&](int64_t mci, int64_t nc, int64_t) {
+      int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
+      zero_buffer(y_buf, m_size * block_n);
+      for (int kci = 0; kci < Kc; ++kci) {
+        auto scales_a = a_scales_ptr + mci * block_m * num_groups + kci / block_per_group;
+        auto scales_b = b_scales_ptr + nc * block_n * num_groups + kci / block_per_group * block_n;
+        _micro_gemm<cpublas_can_pack, block_n, act_quant_mode, wei_quant_mode>(
+            /* C */ y_buf,
+            /* A */ a_ptr + mci * block_m * K + kci * block_k,
+            /* scales_a */ scales_a,
+            /* B */ b_ptr + (nc * Kc + kci) * block_n * block_k,
+            /* scales_b */ scales_b,
+            /* M */ m_size,
+            /* K */ block_k,
+            /* lda */ K,
+            /* ldc */ block_n,
+            /* ldsa */ ldsa,
+            /* ukernel_buf */ ukernel_buf,
+            /* dqA_buf */ dqA_buffer,
+            /* dqB_buf */ dqB_buffer);
       }
-      data_index_step(mc, Mc_parallel, nc, Nc);
-    }
+      auto scales_a = act_quant_mode == PER_TENSOR ? a_scales_ptr
+                      : act_quant_mode == PER_ROW  ? a_scales_ptr + mci * block_m
+                                                   : nullptr;
+      auto scales_b = wei_quant_mode == PER_TENSOR ? b_scales_ptr
+                      : wei_quant_mode == PER_ROW  ? b_scales_ptr + nc * block_n
+                                                   : nullptr;
+      auto bias_data = bias_ptr ? bias_ptr + nc * block_n : nullptr;
+      store_out<out_dtype, block_n, act_quant_mode, wei_quant_mode>(
+          y_buf, c_ptr + mci * block_m * N + nc * block_n, m_size, N /*lda*/, scales_a, scales_b, bias_data);
+    });
+
     if constexpr (cpublas_can_pack) {
       at::native::cpublas::brgemm_release();
     }
@@ -773,6 +765,49 @@ inline __m128i cvtfp32_fp8e4m3(__m512& src) {
   return _mm512_cvtepi32_epi8(packed);
 }
 
+__attribute__((target("avx10.2"))) inline __m128i cvtfp32_fp8e4m3_avx10_2(__m512& src) {
+  __m256i f16_vec = _mm512_cvt_roundps_ph(src, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  return _mm256_cvtph_hf8(_mm256_castsi256_ph(f16_vec));
+}
+
+bool avx10_2_available() {
+  // __builtin_cpu_supports returns the masked feature bit rather than 0/1.
+  static const bool available = __builtin_cpu_supports("avx10.2");
+  return available;
+}
+
+// Carries the whole loop rather than just the conversion as GCC cannot inline avx10.2 function
+// into a caller lacking that target, so branching per vector is costly.
+__attribute__((target("avx10.2"))) void quantize_bf16_block_avx10_2(
+    const at::BFloat16* __restrict__ src,
+    at::Float8_e4m3fn* __restrict__ dst,
+    int64_t count,
+    float scale_reciprocal) {
+  constexpr float quant_max = 448.0f;  // torch.finfo(torch.float8_e4m3fn).max
+  const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
+  const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+  const __m512 neg_quant_max_vec = _mm512_set1_ps(-quant_max);
+
+  for (int64_t i = 0; i <= count - 32; i += 32) {
+    __m256i src_vec1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&src[i]));
+    __m256i src_vec2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&src[i + 16]));
+
+    __m512 fp32_vec1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec1), 16));
+    __m512 fp32_vec2 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec2), 16));
+
+    __m512 scaled_vec1 = _mm512_mul_ps(fp32_vec1, scale_recip_vec);
+    __m512 clamped_vec1 = _mm512_min_ps(_mm512_max_ps(scaled_vec1, neg_quant_max_vec), quant_max_vec);
+
+    __m512 scaled_vec2 = _mm512_mul_ps(fp32_vec2, scale_recip_vec);
+    __m512 clamped_vec2 = _mm512_min_ps(_mm512_max_ps(scaled_vec2, neg_quant_max_vec), quant_max_vec);
+
+    __m128i fp8_vec1 = cvtfp32_fp8e4m3_avx10_2(clamped_vec1);
+    __m128i fp8_vec2 = cvtfp32_fp8e4m3_avx10_2(clamped_vec2);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), fp8_vec1);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i + 16), fp8_vec2);
+  }
+}
+
 std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(const at::Tensor& t) {
   constexpr float quant_max = 448.0f;  // torch.finfo(torch.float8_e4m3fn).max
   constexpr float eps = std::numeric_limits<float>::epsilon();
@@ -783,7 +818,7 @@ std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(co
   int64_t num_channels = t_bf16.size(0);
   int64_t elements_per_channel = t_bf16.numel() / num_channels;
   assert(elements_per_channel % 32 == 0);  // do not consider tile currently
-  at::Tensor quant_t = at::empty_like(t_bf16).to(at::kFloat8_e4m3fn);
+  at::Tensor quant_t = at::empty(t_bf16.sizes(), t_bf16.options().dtype(at::kFloat8_e4m3fn));
 
   // Allocate output tensors
   at::Tensor scale_tensor = at::empty({num_channels}, t_bf16.options().dtype(at::ScalarType::Float));
@@ -828,6 +863,10 @@ std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(co
       scale_data[c] = scale_val;
 
       // Step 3: Scale and clamp using AVX512 (reuse the same loop structure)
+      if (avx10_2_available()) {
+        quantize_bf16_block_avx10_2(channel_src, quant_dst, elements_per_channel, scale_reciprocal);
+        continue;
+      }
       i = 0;
       const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
       const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
@@ -888,7 +927,7 @@ _quantize_fp8e4m3_bf16_per_tensor_with_scale(const at::Tensor& t, at::Tensor& sc
 
   // Apply scale and clamp using AVX512
   const at::BFloat16* src_data = t_bf16.data_ptr<at::BFloat16>();
-  at::Tensor quant_t = at::empty_like(t_bf16).to(at::kFloat8_e4m3fn);
+  at::Tensor quant_t = at::empty(t_bf16.sizes(), t_bf16.options().dtype(at::kFloat8_e4m3fn));
   int64_t total_elements = t_bf16.numel();
   const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
   const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
@@ -901,6 +940,11 @@ _quantize_fp8e4m3_bf16_per_tensor_with_scale(const at::Tensor& t, at::Tensor& sc
     for (int64_t c = start; c < end; ++c) {
       const at::BFloat16* src_data = t_bf16.data_ptr<at::BFloat16>() + c * elements_per_channel;
       at::Float8_e4m3fn* quant_t_data = quant_t.data_ptr<at::Float8_e4m3fn>() + c * elements_per_channel;
+
+      if (avx10_2_available()) {
+        quantize_bf16_block_avx10_2(src_data, quant_t_data, elements_per_channel, scale_reciprocal);
+        continue;
+      }
 
       int64_t i = 0;
       // Process 32 elements at a time using AVX512
